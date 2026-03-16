@@ -1,0 +1,11 @@
+.DS_Store
+.venv/
+.build/
+DerivedData/
+__pycache__/
+*.pyc
+
+codex-coordination-kit/
+.codex-coordination-kit-publish/
+scripts/
+package.json

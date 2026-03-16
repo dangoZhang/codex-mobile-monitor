@@ -1,0 +1,173 @@
+import Foundation
+
+struct CreateSessionBody: Encodable {
+    let title: String?
+}
+
+struct SendMessageBody: Encodable {
+    let text: String
+}
+
+enum BridgeError: LocalizedError {
+    case invalidURL
+    case invalidResponse
+    case server(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidURL:
+            return "Bridge URL 无效"
+        case .invalidResponse:
+            return "Bridge 响应无效"
+        case .server(let message):
+            return message
+        }
+    }
+}
+
+final class BridgeClient {
+    private let session: URLSession
+    private let decoder: JSONDecoder
+    private let encoder: JSONEncoder
+
+    init() {
+        let configuration = URLSessionConfiguration.default
+        configuration.timeoutIntervalForRequest = 120
+        self.session = URLSession(configuration: configuration)
+        self.decoder = JSONDecoder()
+        self.decoder.dateDecodingStrategy = .iso8601WithFractionalSeconds
+        self.encoder = JSONEncoder()
+    }
+
+    func fetchSessions(baseURL: URL) async throws -> [SessionSummary] {
+        let (data, response) = try await session.data(from: baseURL.bridgeEndpoint("api/sessions"))
+        try validate(response: response, data: data)
+        return try decoder.decode(SessionListResponse.self, from: data).sessions
+    }
+
+    func createSession(baseURL: URL, title: String? = nil) async throws -> SessionDetail {
+        var request = URLRequest(url: baseURL.bridgeEndpoint("api/sessions"))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try encoder.encode(CreateSessionBody(title: title))
+        let (data, response) = try await session.data(for: request)
+        try validate(response: response, data: data)
+        return try decoder.decode(SessionDetail.self, from: data)
+    }
+
+    func fetchSession(baseURL: URL, sessionID: String) async throws -> SessionDetail {
+        let url = baseURL.bridgeEndpoint("api/sessions/\(sessionID)")
+        let (data, response) = try await session.data(from: url)
+        try validate(response: response, data: data)
+        return try decoder.decode(SessionDetail.self, from: data)
+    }
+
+    func sendMessage(baseURL: URL, sessionID: String, text: String) async throws {
+        var request = URLRequest(url: baseURL.bridgeEndpoint("api/sessions/\(sessionID)/messages"))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try encoder.encode(SendMessageBody(text: text))
+        let (data, response) = try await session.data(for: request)
+        try validate(response: response, data: data)
+    }
+
+    func streamEvents(
+        baseURL: URL,
+        sessionID: String,
+        after: Int,
+        onEvent: @escaping @Sendable (BridgeEvent) async -> Void,
+        onFailure: @escaping @Sendable (Error) async -> Void
+    ) -> Task<Void, Never> {
+        Task.detached(priority: .background) {
+            do {
+                var components = URLComponents(url: baseURL.bridgeEndpoint("api/sessions/\(sessionID)/events"), resolvingAgainstBaseURL: false)
+                components?.queryItems = [URLQueryItem(name: "after", value: String(after))]
+                guard let url = components?.url else {
+                    throw BridgeError.invalidURL
+                }
+
+                let request = URLRequest(url: url)
+                let (bytes, response) = try await self.session.bytes(for: request)
+                try self.validate(response: response, data: Data())
+
+                var currentID: String?
+                var dataLines: [String] = []
+                for try await line in bytes.lines {
+                    if line.isEmpty {
+                        guard !dataLines.isEmpty else {
+                            currentID = nil
+                            continue
+                        }
+                        let merged = dataLines.joined(separator: "\n")
+                        if let payload = merged.data(using: .utf8) {
+                            let event = try self.decoder.decode(BridgeEvent.self, from: payload)
+                            await onEvent(event)
+                        }
+                        currentID = nil
+                        dataLines = []
+                        continue
+                    }
+
+                    if line.hasPrefix("id:") {
+                        currentID = String(line.dropFirst(3)).trimmingCharacters(in: .whitespaces)
+                    } else if line.hasPrefix("data:") {
+                        dataLines.append(String(line.dropFirst(5)).trimmingCharacters(in: .whitespaces))
+                    } else if line.hasPrefix(":") {
+                        continue
+                    }
+                }
+                _ = currentID
+            } catch {
+                await onFailure(error)
+            }
+        }
+    }
+
+    private func validate(response: URLResponse, data: Data) throws {
+        guard let http = response as? HTTPURLResponse else {
+            throw BridgeError.invalidResponse
+        }
+        guard (200..<300).contains(http.statusCode) else {
+            if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let message = object["error"] as? String {
+                throw BridgeError.server(message)
+            }
+            throw BridgeError.server("Bridge 返回状态码 \(http.statusCode)")
+        }
+    }
+}
+
+private extension JSONDecoder.DateDecodingStrategy {
+    static let iso8601WithFractionalSeconds = custom { decoder in
+        let container = try decoder.singleValueContainer()
+        let raw = try container.decode(String.self)
+        if let date = ISO8601DateFormatter.fractional.date(from: raw) ?? ISO8601DateFormatter.simple.date(from: raw) {
+            return date
+        }
+        throw DecodingError.dataCorruptedError(in: container, debugDescription: "Invalid ISO8601 date: \(raw)")
+    }
+}
+
+private extension ISO8601DateFormatter {
+    static let fractional: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+
+    static let simple: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter
+    }()
+}
+
+private extension URL {
+    func bridgeEndpoint(_ path: String) -> URL {
+        path
+            .split(separator: "/")
+            .reduce(self) { partial, component in
+                partial.appendingPathComponent(String(component))
+            }
+    }
+}
