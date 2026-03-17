@@ -1,9 +1,18 @@
 import Foundation
 import SwiftUI
 
+private enum BridgeURLParser {
+    static func makeBaseURL(from raw: String) -> URL? {
+        let cleaned = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleaned.isEmpty else { return nil }
+        return URL(string: cleaned)
+    }
+}
+
 @MainActor
 final class AppState: ObservableObject {
     @Published var sessions: [SessionSummary] = []
+    @Published var projects: [ProjectSummary] = []
     @Published var selectedSessionID: String?
     @Published var messages: [ChatMessage] = []
     @Published var draft: String = ""
@@ -14,6 +23,8 @@ final class AppState: ObservableObject {
     @Published var errorMessage: String?
     @Published var title: String = "Desktop Threads"
     @Published var currentCWD: String?
+    @Published var currentProjectRoot: String?
+    @Published var currentProjectName: String?
     @Published var currentSource: String = "bridge"
     @Published var currentOriginator: String?
     @Published var isImportedSession = false
@@ -30,13 +41,13 @@ final class AppState: ObservableObject {
 
     init() {
         if let raw = UserDefaults.standard.string(forKey: "bridge_url") {
-            self.baseURL = Self.makeBaseURL(from: raw)
+            self.baseURL = BridgeURLParser.makeBaseURL(from: raw)
         }
     }
 
     func updateBridgeURL(_ raw: String) {
         UserDefaults.standard.set(raw, forKey: "bridge_url")
-        baseURL = Self.makeBaseURL(from: raw)
+        baseURL = BridgeURLParser.makeBaseURL(from: raw)
     }
 
     func bootstrap() async {
@@ -52,11 +63,16 @@ final class AppState: ObservableObject {
         defer { isLoading = false }
         do {
             let fetched = try await bridge.fetchSessions(baseURL: baseURL)
+            let fetchedProjects = try await bridge.fetchProjects(baseURL: baseURL)
             sessions = fetched
+            projects = fetchedProjects
             if let selectedSessionID, fetched.contains(where: { $0.id == selectedSessionID }) {
                 await loadSession(id: selectedSessionID, reconnect: false)
             } else if selectFirst, let first = fetched.first {
                 await loadSession(id: first.id, reconnect: true)
+            } else if fetched.isEmpty {
+                selectedSessionID = nil
+                messages = []
             }
             errorMessage = nil
         } catch {
@@ -80,6 +96,8 @@ final class AppState: ObservableObject {
                 updatedAt: detail.updatedAt,
                 threadID: detail.threadID,
                 cwd: detail.cwd,
+                projectRoot: detail.projectRoot,
+                projectName: detail.projectName,
                 source: detail.source,
                 originator: detail.originator,
                 imported: detail.imported,
@@ -149,6 +167,8 @@ final class AppState: ObservableObject {
         selectedSessionID = detail.id
         title = detail.title
         currentCWD = detail.cwd
+        currentProjectRoot = detail.projectRoot
+        currentProjectName = detail.projectName
         currentSource = detail.source
         currentOriginator = detail.originator
         isImportedSession = detail.imported
@@ -235,6 +255,8 @@ final class AppState: ObservableObject {
             updatedAt: detail.updatedAt,
             threadID: detail.threadID,
             cwd: detail.cwd,
+            projectRoot: detail.projectRoot,
+            projectName: detail.projectName,
             source: detail.source,
             originator: detail.originator,
             imported: detail.imported,
@@ -256,9 +278,77 @@ final class AppState: ObservableObject {
         sessions.sort { $0.updatedAt > $1.updatedAt }
     }
 
-    private static func makeBaseURL(from raw: String) -> URL? {
-        let cleaned = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !cleaned.isEmpty else { return nil }
-        return URL(string: cleaned)
+}
+
+@MainActor
+final class BoardState: ObservableObject {
+    @Published var boards: [BoardSummary] = []
+    @Published var selectedBoardID: String?
+    @Published var board: BoardDetail?
+    @Published var isLoading = false
+    @Published var errorMessage: String?
+
+    private let bridge = BridgeClient()
+    private(set) var baseURL: URL?
+
+    init() {
+        if let raw = UserDefaults.standard.string(forKey: "bridge_url") {
+            self.baseURL = BridgeURLParser.makeBaseURL(from: raw)
+        }
+    }
+
+    func updateBridgeURL(_ raw: String) {
+        UserDefaults.standard.set(raw, forKey: "bridge_url")
+        baseURL = BridgeURLParser.makeBaseURL(from: raw)
+    }
+
+    func bootstrap() async {
+        await refreshBoards(selectFirst: true)
+    }
+
+    func refreshBoards(selectFirst: Bool = false) async {
+        guard let baseURL else {
+            errorMessage = "先填写 Mac Bridge 地址"
+            boards = []
+            board = nil
+            selectedBoardID = nil
+            return
+        }
+
+        isLoading = true
+        defer { isLoading = false }
+
+        do {
+            let fetched = try await bridge.fetchBoards(baseURL: baseURL)
+            boards = fetched
+
+            if let selectedBoardID, fetched.contains(where: { $0.id == selectedBoardID }) {
+                await loadBoard(id: selectedBoardID)
+            } else if let first = fetched.first, selectFirst || selectedBoardID != nil || board == nil {
+                await loadBoard(id: first.id)
+            } else if fetched.isEmpty {
+                selectedBoardID = nil
+                board = nil
+            }
+
+            errorMessage = nil
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func loadBoard(id: String) async {
+        guard let baseURL else { return }
+
+        isLoading = true
+        defer { isLoading = false }
+
+        do {
+            board = try await bridge.fetchBoard(baseURL: baseURL, boardID: id)
+            selectedBoardID = id
+            errorMessage = nil
+        } catch {
+            errorMessage = error.localizedDescription
+        }
     }
 }

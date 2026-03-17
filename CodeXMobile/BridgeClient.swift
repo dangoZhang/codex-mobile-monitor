@@ -45,6 +45,12 @@ final class BridgeClient {
         return try decoder.decode(SessionListResponse.self, from: data).sessions
     }
 
+    func fetchProjects(baseURL: URL) async throws -> [ProjectSummary] {
+        let (data, response) = try await session.data(from: baseURL.bridgeEndpoint("api/projects"))
+        try validate(response: response, data: data)
+        return try decoder.decode(ProjectListResponse.self, from: data).projects
+    }
+
     func createSession(baseURL: URL, title: String? = nil) async throws -> SessionDetail {
         var request = URLRequest(url: baseURL.bridgeEndpoint("api/sessions"))
         request.httpMethod = "POST"
@@ -60,6 +66,19 @@ final class BridgeClient {
         let (data, response) = try await session.data(from: url)
         try validate(response: response, data: data)
         return try decoder.decode(SessionDetail.self, from: data)
+    }
+
+    func fetchBoards(baseURL: URL) async throws -> [BoardSummary] {
+        let (data, response) = try await session.data(from: baseURL.bridgeEndpoint("api/boards"))
+        try validate(response: response, data: data)
+        return try decoder.decode(BoardListResponse.self, from: data).boards
+    }
+
+    func fetchBoard(baseURL: URL, boardID: String) async throws -> BoardDetail {
+        let url = baseURL.bridgeEndpoint("api/boards/\(boardID)")
+        let (data, response) = try await session.data(from: url)
+        try validate(response: response, data: data)
+        return try decoder.decode(BoardDetail.self, from: data)
     }
 
     func sendMessage(baseURL: URL, sessionID: String, text: String) async throws {

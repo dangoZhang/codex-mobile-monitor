@@ -4,8 +4,11 @@
 DerivedData/
 __pycache__/
 *.pyc
+.idea/
+.vscode/
 
 codex-coordination-kit/
 .codex-coordination-kit-publish/
 scripts/
 package.json
+dist/

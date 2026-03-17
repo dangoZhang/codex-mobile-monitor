@@ -4,6 +4,24 @@ struct SessionListResponse: Decodable {
     let sessions: [SessionSummary]
 }
 
+struct ProjectListResponse: Decodable {
+    let projects: [ProjectSummary]
+}
+
+struct ProjectSummary: Decodable, Identifiable, Hashable {
+    let id: String
+    let name: String
+    let path: String
+    let updatedAt: Date
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case name
+        case path
+        case updatedAt = "updated_at"
+    }
+}
+
 struct SessionSummary: Decodable, Identifiable, Hashable {
     let id: String
     let title: String
@@ -11,6 +29,8 @@ struct SessionSummary: Decodable, Identifiable, Hashable {
     let updatedAt: Date
     let threadID: String?
     let cwd: String?
+    let projectRoot: String?
+    let projectName: String?
     let source: String
     let originator: String?
     let imported: Bool
@@ -31,6 +51,8 @@ struct SessionSummary: Decodable, Identifiable, Hashable {
         case updatedAt = "updated_at"
         case threadID = "thread_id"
         case cwd
+        case projectRoot = "project_root"
+        case projectName = "project_name"
         case source
         case originator
         case imported
@@ -53,6 +75,8 @@ struct SessionDetail: Decodable {
     let updatedAt: Date
     let threadID: String?
     let cwd: String?
+    let projectRoot: String?
+    let projectName: String?
     let source: String
     let originator: String?
     let imported: Bool
@@ -75,6 +99,8 @@ struct SessionDetail: Decodable {
         case updatedAt = "updated_at"
         case threadID = "thread_id"
         case cwd
+        case projectRoot = "project_root"
+        case projectName = "project_name"
         case source
         case originator
         case imported
@@ -141,5 +167,222 @@ struct BridgeEvent: Decodable {
             case threadID = "thread_id"
             case running
         }
+    }
+}
+
+struct BoardListResponse: Decodable {
+    let boards: [BoardSummary]
+}
+
+struct BoardSummary: Decodable, Identifiable, Hashable {
+    let id: String
+    let title: String
+    let path: String
+    let updatedAt: Date
+    let taskCount: Int
+    let threadCount: Int
+    let totals: BoardTotals
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case title
+        case path
+        case updatedAt = "updated_at"
+        case taskCount = "task_count"
+        case threadCount = "thread_count"
+        case totals
+    }
+}
+
+struct BoardDetail: Decodable {
+    let id: String
+    let title: String
+    let path: String
+    let generatedAt: Date
+    let updatedAt: Date
+    let taskCount: Int
+    let threadCount: Int
+    let baseBranch: String?
+    let targetRepoRoot: String?
+    let repo: BoardRepoSnapshot?
+    let totals: BoardTotals
+    let columns: [BoardColumn]
+    let threads: [BoardThread]
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case title
+        case path
+        case generatedAt = "generated_at"
+        case updatedAt = "updated_at"
+        case taskCount = "task_count"
+        case threadCount = "thread_count"
+        case baseBranch = "base_branch"
+        case targetRepoRoot = "target_repo_root"
+        case repo
+        case totals
+        case columns
+        case threads
+    }
+}
+
+struct BoardTotals: Decodable, Hashable {
+    let blocked: Int
+    let inProgress: Int
+    let todo: Int
+    let done: Int
+
+    private enum CodingKeys: String, CodingKey {
+        case blocked
+        case inProgress = "in_progress"
+        case todo
+        case done
+    }
+}
+
+struct BoardColumn: Decodable, Identifiable, Hashable {
+    let id: String
+    let status: String
+    let title: String
+    let count: Int
+    let tasks: [BoardTask]
+}
+
+struct BoardTask: Decodable, Identifiable, Hashable {
+    let id: String
+    let thread: String
+    let title: String
+    let owner: String
+    let status: String
+    let dependsOn: String
+    let output: String
+    let lineNo: Int
+    let slot: String
+    let displayName: String
+    let role: String
+    let autoBranch: Bool
+    let latestLog: BoardLogEntry?
+    let branches: BoardBranches?
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case thread
+        case title
+        case owner
+        case status
+        case dependsOn = "depends_on"
+        case output
+        case lineNo = "line_no"
+        case slot
+        case displayName = "display_name"
+        case role
+        case autoBranch = "auto_branch"
+        case latestLog = "latest_log"
+        case branches
+    }
+}
+
+struct BoardThread: Decodable, Identifiable, Hashable {
+    let thread: String
+    let slot: String
+    let displayName: String
+    let role: String
+    let autoBranch: Bool
+    let task: BoardTask?
+    let lastLog: BoardLogEntry?
+    let runtimeStart: BoardRuntimeStart?
+    let lastInvocation: BoardInvocation?
+    let branches: BoardBranches?
+
+    var id: String { thread }
+
+    private enum CodingKeys: String, CodingKey {
+        case thread
+        case slot
+        case displayName = "display_name"
+        case role
+        case autoBranch = "auto_branch"
+        case task
+        case lastLog = "last_log"
+        case runtimeStart = "runtime_start"
+        case lastInvocation = "last_invocation"
+        case branches
+    }
+}
+
+struct BoardLogEntry: Decodable, Hashable {
+    let timestamp: String
+    let type: String
+    let message: String
+    let lineNo: Int
+
+    private enum CodingKeys: String, CodingKey {
+        case timestamp
+        case type
+        case message
+        case lineNo = "line_no"
+    }
+}
+
+struct BoardRuntimeStart: Decodable, Hashable {
+    let timestamp: String
+    let message: String
+    let lineNo: Int
+
+    private enum CodingKeys: String, CodingKey {
+        case timestamp
+        case message
+        case lineNo = "line_no"
+    }
+}
+
+struct BoardInvocation: Decodable, Hashable {
+    let startTimestamp: String
+    let endTimestamp: String
+    let elapsedSeconds: Int
+    let endType: String
+    let startLineNo: Int
+    let endLineNo: Int
+
+    private enum CodingKeys: String, CodingKey {
+        case startTimestamp = "start_timestamp"
+        case endTimestamp = "end_timestamp"
+        case elapsedSeconds = "elapsed_seconds"
+        case endType = "end_type"
+        case startLineNo = "start_line_no"
+        case endLineNo = "end_line_no"
+    }
+}
+
+struct BoardBranches: Decodable, Hashable {
+    let expectedPrefix: String
+    let local: [BoardBranchRef]
+    let remote: [String]
+
+    private enum CodingKeys: String, CodingKey {
+        case expectedPrefix = "expected_prefix"
+        case local
+        case remote
+    }
+}
+
+struct BoardBranchRef: Decodable, Hashable {
+    let name: String
+    let worktree: String?
+}
+
+struct BoardRepoSnapshot: Decodable, Hashable {
+    let configured: Bool
+    let error: String?
+    let currentBranch: String?
+    let dirty: Bool?
+    let legacyLocalBranches: [String]?
+
+    private enum CodingKeys: String, CodingKey {
+        case configured
+        case error
+        case currentBranch = "current_branch"
+        case dirty
+        case legacyLocalBranches = "legacy_local_branches"
     }
 }
