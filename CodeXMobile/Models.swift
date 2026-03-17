@@ -174,10 +174,31 @@ struct BoardListResponse: Decodable {
     let boards: [BoardSummary]
 }
 
+struct BoardFolderListResponse: Decodable {
+    let folders: [BoardFolderSummary]
+}
+
+struct BoardFolderSummary: Decodable, Identifiable, Hashable {
+    let id: String
+    let name: String
+    let path: String
+    let boardCount: Int
+    let updatedAt: Date
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case name
+        case path
+        case boardCount = "board_count"
+        case updatedAt = "updated_at"
+    }
+}
+
 struct BoardSummary: Decodable, Identifiable, Hashable {
     let id: String
     let title: String
     let path: String
+    let folderPath: String
     let updatedAt: Date
     let taskCount: Int
     let threadCount: Int
@@ -187,6 +208,7 @@ struct BoardSummary: Decodable, Identifiable, Hashable {
         case id
         case title
         case path
+        case folderPath = "folder_path"
         case updatedAt = "updated_at"
         case taskCount = "task_count"
         case threadCount = "thread_count"
@@ -198,6 +220,7 @@ struct BoardDetail: Decodable {
     let id: String
     let title: String
     let path: String
+    let folderPath: String
     let generatedAt: Date
     let updatedAt: Date
     let taskCount: Int
@@ -213,6 +236,7 @@ struct BoardDetail: Decodable {
         case id
         case title
         case path
+        case folderPath = "folder_path"
         case generatedAt = "generated_at"
         case updatedAt = "updated_at"
         case taskCount = "task_count"

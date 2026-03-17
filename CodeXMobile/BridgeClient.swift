@@ -74,6 +74,25 @@ final class BridgeClient {
         return try decoder.decode(BoardListResponse.self, from: data).boards
     }
 
+    func fetchBoardFolders(baseURL: URL) async throws -> [BoardFolderSummary] {
+        let (data, response) = try await session.data(from: baseURL.bridgeEndpoint("api/board-folders"))
+        try validate(response: response, data: data)
+        return try decoder.decode(BoardFolderListResponse.self, from: data).folders
+    }
+
+    func fetchBoards(baseURL: URL, folderPath: String?) async throws -> [BoardSummary] {
+        var components = URLComponents(url: baseURL.bridgeEndpoint("api/boards"), resolvingAgainstBaseURL: false)
+        if let folderPath, !folderPath.isEmpty {
+            components?.queryItems = [URLQueryItem(name: "folder", value: folderPath)]
+        }
+        guard let url = components?.url else {
+            throw BridgeError.invalidURL
+        }
+        let (data, response) = try await session.data(from: url)
+        try validate(response: response, data: data)
+        return try decoder.decode(BoardListResponse.self, from: data).boards
+    }
+
     func fetchBoard(baseURL: URL, boardID: String) async throws -> BoardDetail {
         let url = baseURL.bridgeEndpoint("api/boards/\(boardID)")
         let (data, response) = try await session.data(from: url)

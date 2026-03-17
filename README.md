@@ -58,9 +58,81 @@ iOS 客户端：
 - Xcode 16+
 - iPhone or iPad
 
-## Quick Start / 快速开始
+## Installation / 安装流程
 
-### 1. Run the Mac bridge / 启动 Mac bridge
+### A. Prepare the Mac / 准备 Mac
+
+English:
+
+1. Install and open Codex Desktop at least once on the Mac
+2. Install Xcode 16 or newer
+3. Open Xcode once so it can finish first-launch setup
+4. Make sure Python 3.11+ is available in Terminal
+
+中文：
+
+1. 先在 Mac 上安装并至少启动过一次 Codex Desktop
+2. 安装 Xcode 16 或更新版本
+3. 至少打开一次 Xcode，让它完成首次初始化
+4. 确保终端里可用 Python 3.11+
+
+### B. Prepare Xcode Signing / 配置 Xcode 签名
+
+English:
+
+1. Open Xcode
+2. Go to `Xcode -> Settings -> Accounts`
+3. Sign in with your Apple ID
+4. Open `CodeXMobile.xcodeproj`
+5. Select the `CodeXMobile` target
+6. Open `Signing & Capabilities`
+7. Keep `Automatically manage signing` enabled
+8. Choose your `Personal Team` or paid team in `Team`
+9. Wait for Xcode to generate the provisioning profile once
+
+中文：
+
+1. 打开 Xcode
+2. 进入 `Xcode -> 设置 -> Accounts`
+3. 登录你的 Apple ID
+4. 打开 `CodeXMobile.xcodeproj`
+5. 选中 `CodeXMobile` target
+6. 打开 `Signing & Capabilities`
+7. 保持 `Automatically manage signing` 开启
+8. 在 `Team` 里选择你的 `Personal Team` 或付费团队
+9. 等 Xcode 首次生成好 provisioning profile
+
+### C. Prepare the iPhone or iPad / 准备 iPhone 或 iPad
+
+English:
+
+1. Connect the device to the Mac with a cable
+2. Unlock the device
+3. Tap `Trust This Computer` if prompted
+4. Enable `Developer Mode` on the device:
+   `Settings -> Privacy & Security -> Developer Mode`
+5. Reboot the device if iOS asks for it
+6. Reconnect the device after reboot
+
+中文：
+
+1. 用数据线把设备连接到 Mac
+2. 保持设备解锁
+3. 如果有提示，点 `信任此电脑`
+4. 在设备上开启 `开发者模式`：
+   `设置 -> 隐私与安全性 -> 开发者模式`
+5. 如果 iOS 要求重启，就按提示重启
+6. 重启后重新连接设备
+
+### D. Start the Mac Bridge / 启动 Mac Bridge
+
+English:
+
+```bash
+./tools/run-bridge.sh
+```
+
+中文：
 
 ```bash
 ./tools/run-bridge.sh
@@ -81,40 +153,63 @@ CODEX_BRIDGE_CWD="$(pwd)"
 CODEX_BRIDGE_IMPORT_LIMIT=60
 CODEX_BRIDGE_POLL_SECONDS=2
 CODEX_BRIDGE_ALLOWED_SOURCES=vscode,app
+CODEX_BRIDGE_BOARD_FOLDERS=/absolute/path/to/folder-one,/absolute/path/to/folder-two
 CODEX_BRIDGE_BOARD_ROOTS=/absolute/path/to/board-one,/absolute/path/to/board-two
 ```
 
-### 2. Install to iPhone or iPad / 安装到 iPhone 或 iPad
+### E. Install the App from Terminal / 用终端安装 App
 
-If your Apple ID is already added in Xcode, this is the closest thing to one-click install:
+English:
+
+After Xcode signing is ready, run:
 
 ```bash
 DEVELOPMENT_TEAM=YOUR_TEAM_ID ./tools/install-ios.sh
 ```
 
-What it does:
+The script will:
 
-- builds the app for a connected physical device
-- uses Xcode automatic signing
-- installs the app with `devicectl`
-- launches the app after install
+- build the app for the connected physical device
+- use Xcode automatic signing
+- enable developer disk image services when available
+- install the app with `devicectl`
+- launch the app after install
 
-If `install-ios.sh` cannot sign on your machine, open `CodeXMobile.xcodeproj` in Xcode once, select your Personal Team, then run the script again.
+中文：
 
-如果你的 Apple ID 已经登录到 Xcode，这基本就是当前项目的“一键安装”方式：
+当 Xcode 签名准备好后，运行：
 
 ```bash
-DEVELOPMENT_TEAM=你的 Team ID ./tools/install-ios.sh
+DEVELOPMENT_TEAM=你的TEAM_ID ./tools/install-ios.sh
 ```
 
 脚本会：
 
 - 为已连接真机构建应用
 - 使用 Xcode 自动签名
+- 在可用时启用 developer disk image services
 - 通过 `devicectl` 安装到设备
 - 安装后自动启动
 
-如果脚本因为签名失败，先用 Xcode 打开 `CodeXMobile.xcodeproj`，为 target 选一次 Personal Team，再重新运行脚本。
+### F. Trust the Developer Certificate on First Install / 首次安装后信任开发者证书
+
+English:
+
+If the app installs but does not open, trust the developer certificate on the device:
+
+1. Open `Settings -> General -> VPN & Device Management`
+2. Find your Apple Development certificate
+3. Tap `Trust`
+4. Return to the Home Screen and open `CodeXMobile`
+
+中文：
+
+如果 App 已安装但无法打开，需要在设备上手动信任开发者证书：
+
+1. 打开 `设置 -> 通用 -> VPN与设备管理`
+2. 找到你的 Apple Development 证书
+3. 点击 `信任`
+4. 回到桌面重新打开 `CodeXMobile`
 
 ## Connect the App to Your Mac / 让 App 连接你的 Mac
 
@@ -173,11 +268,40 @@ Recommended constraints:
 - 不要无保护地直接暴露到公网
 - 优先使用只有你自己设备可达的隧道
 
+## Troubleshooting / 故障排查
+
+English:
+
+- `No connected iPhone/iPad found`
+  Check cable, unlock the device, trust the Mac, and make sure Developer Mode is enabled.
+- `Set DEVELOPMENT_TEAM or TEAM_ID`
+  Open Xcode once and select a valid Team in `Signing & Capabilities`.
+- App installs but does not launch
+  Trust the developer certificate in `VPN & Device Management`.
+- The iPhone cannot reach the Mac bridge
+  Verify the Mac and iPhone are on the same network, and test `http://YOUR_MAC_IP:8765/healthz`.
+- Board page does not show the expected project
+  Set `CODEX_BRIDGE_BOARD_FOLDERS` or `CODEX_BRIDGE_BOARD_ROOTS` before starting the bridge.
+
+中文：
+
+- `No connected iPhone/iPad found`
+  检查数据线、设备是否解锁、是否已信任这台 Mac、是否已开启开发者模式。
+- `Set DEVELOPMENT_TEAM or TEAM_ID`
+  先用 Xcode 打开工程，并在 `Signing & Capabilities` 里选好 Team。
+- App 已安装但无法启动
+  去 `VPN与设备管理` 信任开发者证书。
+- iPhone 连不到 Mac bridge
+  确认 Mac 和 iPhone 在同一网络，并测试 `http://你的Mac局域网IP:8765/healthz`。
+- 看板页没有你想要的项目
+  启动 bridge 前配置 `CODEX_BRIDGE_BOARD_FOLDERS` 或 `CODEX_BRIDGE_BOARD_ROOTS`。
+
 ## API / 接口
 
 - `GET /healthz`
 - `GET /api/sessions`
 - `GET /api/projects`
+- `GET /api/board-folders`
 - `GET /api/sessions/{id}`
 - `POST /api/sessions/{id}/messages`
 - `GET /api/sessions/{id}/events?after=<seq>`

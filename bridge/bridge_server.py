@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import json
 import os
@@ -368,6 +369,67 @@ def is_board_root(path: Path) -> bool:
     )
 
 
+def board_id_for_path(board_root: Path) -> str:
+    encoded = base64.urlsafe_b64encode(str(board_root).encode("utf-8")).decode("ascii")
+    return encoded.rstrip("=")
+
+
+def discover_boards_in_folder(folder: Path) -> list[Path]:
+    resolved = folder.expanduser().resolve()
+    if not resolved.exists() or not resolved.is_dir():
+        return []
+
+    boards: list[Path] = []
+    seen: set[Path] = set()
+
+    if is_board_root(resolved):
+        seen.add(resolved)
+        boards.append(resolved)
+
+    for child in sorted(resolved.iterdir(), key=lambda item: item.name.lower()):
+        if child.name.startswith("."):
+            continue
+        child_resolved = child.resolve()
+        if child_resolved in seen or not is_board_root(child_resolved):
+            continue
+        seen.add(child_resolved)
+        boards.append(child_resolved)
+
+    return boards
+
+
+def discover_board_folders(
+    workspace: Path,
+    configured_folders: tuple[Path, ...],
+    configured_board_roots: tuple[Path, ...],
+    recent_project_paths: list[str],
+) -> list[Path]:
+    candidates: list[Path] = [workspace, workspace.parent]
+    candidates.extend(configured_folders)
+    for board_root in configured_board_roots:
+        candidates.append(board_root)
+        candidates.append(board_root.parent)
+    for raw_path in recent_project_paths:
+        candidate = Path(raw_path).expanduser()
+        candidates.append(candidate)
+        candidates.append(candidate.parent)
+
+    folders: list[Path] = []
+    seen: set[Path] = set()
+    for candidate in candidates:
+        if not str(candidate).strip():
+            continue
+        resolved = candidate.resolve() if candidate.exists() else candidate
+        if resolved in seen or not resolved.exists() or not resolved.is_dir():
+            continue
+        if not discover_boards_in_folder(resolved):
+            continue
+        seen.add(resolved)
+        folders.append(resolved)
+
+    return folders
+
+
 def discover_board_roots(workspace: Path, configured_roots: tuple[Path, ...]) -> list[Path]:
     candidates: list[Path] = []
     seen: set[Path] = set()
@@ -718,9 +780,10 @@ def read_board_snapshot(board_root: Path) -> dict[str, Any]:
         if path.exists()
     )
     return {
-        "id": board_root.name,
+        "id": board_id_for_path(board_root),
         "title": title,
         "path": str(board_root),
+        "folder_path": str(board_root.parent),
         "generated_at": utc_now(),
         "updated_at": unix_to_iso(updated_at),
         "task_count": len(tasks),
@@ -889,6 +952,7 @@ class SessionStore:
         scan_limit: int,
         poll_interval: float,
         allowed_sources: set[str],
+        board_folders: tuple[Path, ...],
         board_roots: tuple[Path, ...],
     ) -> None:
         self.workspace = workspace
@@ -897,6 +961,7 @@ class SessionStore:
         self.scan_limit = scan_limit
         self.poll_interval = poll_interval
         self.allowed_sources = allowed_sources
+        self.board_folders = board_folders
         self.board_roots = board_roots
         self.sessions: dict[str, ChatSession] = {}
         self.lock = asyncio.Lock()
@@ -955,6 +1020,46 @@ class SessionStore:
         if not self.threads_db_path.exists():
             return []
         return await asyncio.to_thread(read_recent_projects_from_sqlite, self.threads_db_path, self.scan_limit)
+
+    async def list_board_folders(self) -> list[dict[str, Any]]:
+        recent_project_paths: list[str] = []
+        if self.threads_db_path.exists():
+            recent_projects = await asyncio.to_thread(read_recent_projects_from_sqlite, self.threads_db_path, self.scan_limit)
+            recent_project_paths = [str(item.get("path") or "") for item in recent_projects]
+
+        folders = await asyncio.to_thread(
+            discover_board_folders,
+            self.workspace,
+            self.board_folders,
+            self.board_roots,
+            recent_project_paths,
+        )
+
+        serialized: list[dict[str, Any]] = []
+        for folder in folders:
+            boards = discover_boards_in_folder(folder)
+            if not boards:
+                continue
+            latest_updated = max(
+                max(
+                    path.stat().st_mtime
+                    for path in (board / "TASK_BOARD.md", board / "THREADS.json", board / "COMM_LOG.md")
+                    if path.exists()
+                )
+                for board in boards
+            )
+            serialized.append(
+                {
+                    "id": str(folder),
+                    "name": folder.name or str(folder),
+                    "path": str(folder),
+                    "board_count": len(boards),
+                    "updated_at": unix_to_iso(latest_updated),
+                }
+            )
+
+        serialized.sort(key=lambda item: item["updated_at"], reverse=True)
+        return serialized
 
     async def add_message(self, session: ChatSession, role: str, text: str, state: str = "done") -> ChatMessage:
         async with self.lock:
@@ -1015,6 +1120,7 @@ class SessionStore:
 
     async def _upsert_thread_record(self, record: ThreadRecord) -> None:
         session: ChatSession
+        metadata_changed = False
         async with self.lock:
             session = self.sessions.get(record.thread_id) or ChatSession(
                 id=record.thread_id,
@@ -1030,6 +1136,16 @@ class SessionStore:
             )
             self.sessions[record.thread_id] = session
 
+            previous_summary = (
+                session.title,
+                session.created_at,
+                session.updated_at,
+                session.cwd,
+                session.source,
+                session.rollout_path,
+                session.model_provider,
+                session.cli_version,
+            )
             session.title = record.title
             session.created_at = record.created_at
             session.updated_at = record.updated_at
@@ -1045,9 +1161,21 @@ class SessionStore:
             session.cli_version = record.cli_version
             if not session.messages and record.first_user_message and session.title.startswith("Thread "):
                 session.title = record.first_user_message.splitlines()[0][:48]
+            metadata_changed = previous_summary != (
+                session.title,
+                session.created_at,
+                session.updated_at,
+                session.cwd,
+                session.source,
+                session.rollout_path,
+                session.model_provider,
+                session.cli_version,
+            )
 
         rollout_path = Path(record.rollout_path).expanduser()
         if not rollout_path.exists():
+            if metadata_changed:
+                await self.publish(session, "session.synced", {"session": session.summary()})
             return
 
         should_reset = rollout_path.stat().st_size < session.last_read_offset
@@ -1056,6 +1184,8 @@ class SessionStore:
             and session.last_disk_mtime_ns == rollout_path.stat().st_mtime_ns
             and session.last_disk_size == rollout_path.stat().st_size
         ):
+            if metadata_changed:
+                await self.publish(session, "session.synced", {"session": session.summary()})
             return
 
         delta = await asyncio.to_thread(
@@ -1187,13 +1317,14 @@ async def run_codex(session: ChatSession, store: SessionStore, prompt: str, cwd:
 
 async def handle_health(request: web.Request) -> web.Response:
     store: SessionStore = request.app["store"]
-    boards = discover_board_roots(store.workspace, store.board_roots)
+    board_folders = await store.list_board_folders()
+    board_count = sum(int(item["board_count"]) for item in board_folders)
     return json_response(
         {
             "ok": True,
             "timestamp": utc_now(),
             "session_count": len(store.sessions),
-            "board_count": len(boards),
+            "board_count": board_count,
             "allowed_sources": sorted(store.allowed_sources),
         }
     )
@@ -1201,17 +1332,19 @@ async def handle_health(request: web.Request) -> web.Response:
 
 async def handle_root(request: web.Request) -> web.Response:
     store: SessionStore = request.app["store"]
-    boards = discover_board_roots(store.workspace, store.board_roots)
+    board_folders = await store.list_board_folders()
+    board_count = sum(int(item["board_count"]) for item in board_folders)
     return json_response(
         {
             "name": "CodeX Mobile Bridge",
             "allowed_sources": sorted(store.allowed_sources),
             "session_count": len(store.sessions),
-            "board_count": len(boards),
+            "board_count": board_count,
             "routes": [
                 "/healthz",
                 "/api/sessions",
                 "/api/projects",
+                "/api/board-folders",
                 "/api/sessions/{id}",
                 "/api/sessions/{id}/messages",
                 "/api/sessions/{id}/events",
@@ -1333,30 +1466,43 @@ async def handle_events(request: web.Request) -> web.StreamResponse:
 
 async def handle_list_boards(request: web.Request) -> web.Response:
     store: SessionStore = request.app["store"]
+    folder_query = (request.query.get("folder") or "").strip()
+    if folder_query:
+        scan_folders = [Path(folder_query).expanduser().resolve()]
+    else:
+        scan_folders = [Path(item["path"]) for item in await store.list_board_folders()]
     boards: list[dict[str, Any]] = []
-    for board_root in discover_board_roots(store.workspace, store.board_roots):
-        snapshot = read_board_snapshot(board_root)
-        boards.append(
-            {
-                "id": snapshot["id"],
-                "title": snapshot["title"],
-                "path": snapshot["path"],
-                "updated_at": snapshot["updated_at"],
-                "task_count": snapshot["task_count"],
-                "thread_count": snapshot["thread_count"],
-                "totals": snapshot["totals"],
-            }
-        )
+    for scan_folder in scan_folders:
+        for board_root in discover_boards_in_folder(scan_folder):
+            snapshot = read_board_snapshot(board_root)
+            boards.append(
+                {
+                    "id": snapshot["id"],
+                    "title": snapshot["title"],
+                    "path": snapshot["path"],
+                    "folder_path": snapshot["folder_path"],
+                    "updated_at": snapshot["updated_at"],
+                    "task_count": snapshot["task_count"],
+                    "thread_count": snapshot["thread_count"],
+                    "totals": snapshot["totals"],
+                }
+            )
     boards.sort(key=lambda item: item["updated_at"], reverse=True)
     return json_response({"boards": boards})
+
+
+async def handle_list_board_folders(request: web.Request) -> web.Response:
+    store: SessionStore = request.app["store"]
+    return json_response({"folders": await store.list_board_folders()})
 
 
 async def handle_get_board(request: web.Request) -> web.Response:
     store: SessionStore = request.app["store"]
     board_id = request.match_info["board_id"]
-    for board_root in discover_board_roots(store.workspace, store.board_roots):
-        if board_root.name == board_id:
-            return json_response(read_board_snapshot(board_root))
+    for folder in await store.list_board_folders():
+        for board_root in discover_boards_in_folder(Path(folder["path"])):
+            if board_id_for_path(board_root) == board_id:
+                return json_response(read_board_snapshot(board_root))
     return json_response({"error": "board not found"}, status=404)
 
 
@@ -1386,6 +1532,11 @@ def create_app() -> web.Application:
         for item in os.environ.get("CODEX_BRIDGE_BOARD_ROOTS", "").split(",")
         if item.strip()
     )
+    board_folders = tuple(
+        Path(item.strip()).expanduser().resolve()
+        for item in os.environ.get("CODEX_BRIDGE_BOARD_FOLDERS", "").split(",")
+        if item.strip()
+    )
 
     store = SessionStore(
         workspace=workspace,
@@ -1394,6 +1545,7 @@ def create_app() -> web.Application:
         scan_limit=scan_limit,
         poll_interval=poll_interval,
         allowed_sources=allowed_sources,
+        board_folders=board_folders,
         board_roots=board_roots,
     )
 
@@ -1405,6 +1557,7 @@ def create_app() -> web.Application:
     app.router.add_get("/healthz", handle_health)
     app.router.add_get("/api/sessions", handle_list_sessions)
     app.router.add_get("/api/projects", handle_list_projects)
+    app.router.add_get("/api/board-folders", handle_list_board_folders)
     app.router.add_post("/api/sessions", handle_create_session)
     app.router.add_get("/api/sessions/{session_id}", handle_get_session)
     app.router.add_post("/api/sessions/{session_id}/messages", handle_send_message)

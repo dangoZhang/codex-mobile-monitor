@@ -282,6 +282,8 @@ final class AppState: ObservableObject {
 
 @MainActor
 final class BoardState: ObservableObject {
+    @Published var folders: [BoardFolderSummary] = []
+    @Published var selectedFolderPath: String?
     @Published var boards: [BoardSummary] = []
     @Published var selectedBoardID: String?
     @Published var board: BoardDetail?
@@ -309,6 +311,8 @@ final class BoardState: ObservableObject {
     func refreshBoards(selectFirst: Bool = false) async {
         guard let baseURL else {
             errorMessage = "先填写 Mac Bridge 地址"
+            folders = []
+            selectedFolderPath = nil
             boards = []
             board = nil
             selectedBoardID = nil
@@ -319,7 +323,16 @@ final class BoardState: ObservableObject {
         defer { isLoading = false }
 
         do {
-            let fetched = try await bridge.fetchBoards(baseURL: baseURL)
+            let fetchedFolders = try await bridge.fetchBoardFolders(baseURL: baseURL)
+            folders = fetchedFolders
+
+            if let selectedFolderPath, fetchedFolders.contains(where: { $0.path == selectedFolderPath }) {
+                self.selectedFolderPath = selectedFolderPath
+            } else {
+                self.selectedFolderPath = fetchedFolders.first?.path
+            }
+
+            let fetched = try await bridge.fetchBoards(baseURL: baseURL, folderPath: self.selectedFolderPath)
             boards = fetched
 
             if let selectedBoardID, fetched.contains(where: { $0.id == selectedBoardID }) {
@@ -335,6 +348,14 @@ final class BoardState: ObservableObject {
         } catch {
             errorMessage = error.localizedDescription
         }
+    }
+
+    func selectFolder(path: String) async {
+        guard path != selectedFolderPath else { return }
+        selectedFolderPath = path
+        selectedBoardID = nil
+        board = nil
+        await refreshBoards(selectFirst: true)
     }
 
     func loadBoard(id: String) async {

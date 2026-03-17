@@ -6,6 +6,11 @@ DERIVED_DATA="${ROOT_DIR}/dist/DerivedData"
 SCHEME="CodeXMobile"
 PROJECT="${ROOT_DIR}/CodeXMobile.xcodeproj"
 APP_PATH="${DERIVED_DATA}/Build/Products/Debug-iphoneos/CodeXMobile.app"
+DEVICE_JSON="$(mktemp)"
+cleanup() {
+  rm -f "${DEVICE_JSON}"
+}
+trap cleanup EXIT
 
 if ! command -v xcodebuild >/dev/null 2>&1; then
   echo "xcodebuild not found. Install Xcode first." >&2
@@ -25,11 +30,57 @@ fi
 
 DEVICE_ID="${DEVICE_ID:-}"
 if [[ -z "${DEVICE_ID}" ]]; then
-  DEVICE_ID="$(xcrun devicectl list devices 2>/dev/null | awk '/Connected/ && /iPhone|iPad/ {print $NF; exit}')"
+  xcrun devicectl list devices --json-output "${DEVICE_JSON}" >/dev/null
+  DEVICE_ID="$(python3 - "${DEVICE_JSON}" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, "r", encoding="utf-8") as fh:
+    payload = json.load(fh)
+
+devices = payload.get("result", {}).get("devices", [])
+
+for device in devices:
+    platform = device.get("hardwareProperties", {}).get("platform")
+    reality = device.get("hardwareProperties", {}).get("reality")
+    device_type = device.get("hardwareProperties", {}).get("deviceType")
+    developer_mode = device.get("deviceProperties", {}).get("developerModeStatus")
+    udid = device.get("hardwareProperties", {}).get("udid")
+    if platform == "iOS" and reality == "physical" and device_type in {"iPhone", "iPad"} and developer_mode == "enabled" and udid:
+        print(udid)
+        raise SystemExit(0)
+PY
+)"
 fi
 
 if [[ -z "${DEVICE_ID}" ]]; then
-  echo "No connected iPhone/iPad found. Connect a device, unlock it, and enable Developer Mode." >&2
+  DEVICE_HINT="$(python3 - "${DEVICE_JSON}" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, "r", encoding="utf-8") as fh:
+    payload = json.load(fh)
+
+devices = payload.get("result", {}).get("devices", [])
+for device in devices:
+    platform = device.get("hardwareProperties", {}).get("platform")
+    reality = device.get("hardwareProperties", {}).get("reality")
+    device_type = device.get("hardwareProperties", {}).get("deviceType")
+    if platform != "iOS" or reality != "physical" or device_type not in {"iPhone", "iPad"}:
+        continue
+    name = device.get("deviceProperties", {}).get("name", "iPhone/iPad")
+    developer_mode = device.get("deviceProperties", {}).get("developerModeStatus", "unknown")
+    ddi = device.get("deviceProperties", {}).get("ddiServicesAvailable", False)
+    print(f"Detected {name}, but Developer Mode is {developer_mode} and DDI available is {str(ddi).lower()}.")
+    raise SystemExit(0)
+PY
+)"
+  if [[ -n "${DEVICE_HINT}" ]]; then
+    echo "${DEVICE_HINT}" >&2
+  fi
+  echo "No installable iPhone/iPad found. Unlock the device, enable Developer Mode, reconnect it, and try again." >&2
   exit 1
 fi
 

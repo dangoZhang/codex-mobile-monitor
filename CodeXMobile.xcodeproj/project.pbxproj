@@ -47,8 +47,6 @@
 		};
 		A00000000000000000000032 /* CodeXMobile */ = {
 			isa = PBXGroup;
-			path = CodeXMobile;
-			sourceTree = "<group>";
 			children = (
 				A00000000000000000000001 /* CodeXMobileApp.swift */,
 				A00000000000000000000002 /* ContentView.swift */,
@@ -58,6 +56,8 @@
 				A00000000000000000000006 /* Assets.xcassets */,
 				A00000000000000000000007 /* Info.plist */,
 			);
+			path = CodeXMobile;
+			sourceTree = "<group>";
 		};
 		A00000000000000000000033 /* Products */ = {
 			isa = PBXGroup;
@@ -193,7 +193,7 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = "";
+				DEVELOPMENT_TEAM = KV9UK8WC6F;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = CodeXMobile/Info.plist;
@@ -217,7 +217,7 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = "";
+				DEVELOPMENT_TEAM = KV9UK8WC6F;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = CodeXMobile/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (

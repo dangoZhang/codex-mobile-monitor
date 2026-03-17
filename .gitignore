@@ -6,6 +6,10 @@ __pycache__/
 *.pyc
 .idea/
 .vscode/
+*.xcuserstate
+*.xcuserdata/
+*.xcodeproj/xcuserdata/
+CodeXMobile.xcodeproj/project.xcworkspace/xcuserdata/
 
 codex-coordination-kit/
 .codex-coordination-kit-publish/

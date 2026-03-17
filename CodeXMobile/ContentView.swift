@@ -572,6 +572,7 @@ private struct BoardsWorkspaceDetailView: View {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 24) {
                         header
+                        folderSelector
                         boardSelector
 
                         if let board = state.board {
@@ -599,9 +600,59 @@ private struct BoardsWorkspaceDetailView: View {
             Text("项目看板")
                 .font(.system(size: 30, weight: .semibold))
                 .foregroundStyle(CodexPalette.foreground)
-            Text("独立页面显示同目录协作项目，不混进主线程监督页。")
+            Text("先切换文件夹，再看这个文件夹下的协作看板项目。")
                 .font(.system(size: 14, weight: .regular))
                 .foregroundStyle(CodexPalette.muted)
+        }
+    }
+
+    private var folderSelector: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("文件夹")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(CodexPalette.muted)
+
+            if state.folders.isEmpty {
+                Text("当前没有发现可切换的看板文件夹")
+                    .font(.system(size: 13, weight: .regular))
+                    .foregroundStyle(CodexPalette.subtleText)
+            } else {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 10) {
+                        ForEach(state.folders) { folder in
+                            Button {
+                                Task { await state.selectFolder(path: folder.path) }
+                            } label: {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text(folder.name)
+                                        .font(.system(size: 14, weight: .semibold))
+                                        .lineLimit(1)
+                                    Text(folder.path)
+                                        .font(.system(size: 11, weight: .regular, design: .monospaced))
+                                        .lineLimit(1)
+                                    Text("\(folder.boardCount) 个看板")
+                                        .font(.system(size: 11, weight: .medium))
+                                        .foregroundStyle(CodexPalette.subtleText)
+                                }
+                                .foregroundStyle(state.selectedFolderPath == folder.path ? CodexPalette.foreground : CodexPalette.mutedBright)
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 12)
+                                .frame(width: 280, alignment: .leading)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 18)
+                                        .fill(state.selectedFolderPath == folder.path ? CodexPalette.panel : CodexPalette.sidebar.opacity(0.72))
+                                )
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 18)
+                                        .stroke(state.selectedFolderPath == folder.path ? CodexPalette.accent : CodexPalette.border, lineWidth: 1)
+                                )
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                    .padding(.vertical, 4)
+                }
+            }
         }
     }
 
@@ -1870,23 +1921,25 @@ private struct MessageRowView: View {
             if message.role == "user" {
                 rowLabel(title: labelText, tint: labelColor)
             }
-            Text(message.text)
-                .font(.system(size: message.role == "user" ? 18 : 17, weight: message.role == "user" ? .semibold : .regular))
-                .foregroundStyle(CodexPalette.foreground)
-                .textSelection(.enabled)
-                .lineSpacing(4)
-                .frame(maxWidth: .infinity, alignment: .leading)
+            MarkdownTextView(
+                text: message.text,
+                baseFont: .system(size: message.role == "user" ? 18 : 17, weight: message.role == "user" ? .semibold : .regular),
+                foreground: CodexPalette.foreground,
+                lineSpacing: 4
+            )
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
         .frame(maxWidth: 920, alignment: .leading)
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private var commentaryRow: some View {
-        Text(message.text)
-            .font(.system(size: 14, weight: .regular))
-            .foregroundStyle(CodexPalette.mutedBright)
-            .textSelection(.enabled)
-            .lineSpacing(3)
+        MarkdownTextView(
+            text: message.text,
+            baseFont: .system(size: 14, weight: .regular),
+            foreground: CodexPalette.mutedBright,
+            lineSpacing: 3
+        )
         .frame(maxWidth: 920, alignment: .leading)
         .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -1900,11 +1953,12 @@ private struct MessageRowView: View {
             }
 
             if let detail = toolDetailText, !detail.isEmpty {
-                Text(detail)
-                    .font(.system(size: 13, weight: .regular))
-                    .foregroundStyle(CodexPalette.muted)
-                    .textSelection(.enabled)
-                    .lineSpacing(2)
+                MarkdownTextView(
+                    text: detail,
+                    baseFont: .system(size: 13, weight: .regular),
+                    foreground: CodexPalette.muted,
+                    lineSpacing: 2
+                )
             }
         }
         .frame(maxWidth: 920, alignment: .leading)
@@ -1979,6 +2033,144 @@ private struct MessageRowView: View {
         formatter.dateFormat = "HH:mm"
         return formatter
     }()
+}
+
+private struct MarkdownTextView: View {
+    let text: String
+    let baseFont: Font
+    let foreground: Color
+    let lineSpacing: CGFloat
+
+    private var segments: [MarkdownSegment] {
+        MarkdownSegment.parse(text)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            ForEach(Array(segments.enumerated()), id: \.offset) { _, segment in
+                switch segment {
+                case .markdown(let value):
+                    markdownSection(value)
+                case .codeBlock(let code, let language):
+                    codeSection(code: code, language: language)
+                }
+            }
+        }
+        .tint(CodexPalette.accent)
+        .textSelection(.enabled)
+    }
+
+    @ViewBuilder
+    private func markdownSection(_ value: String) -> some View {
+        if let attributed = try? AttributedString(
+            markdown: value,
+            options: AttributedString.MarkdownParsingOptions(
+                interpretedSyntax: .full,
+                failurePolicy: .returnPartiallyParsedIfPossible
+            )
+        ) {
+            Text(attributed)
+                .font(baseFont)
+                .foregroundStyle(foreground)
+                .lineSpacing(lineSpacing)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        } else {
+            Text(value)
+                .font(baseFont)
+                .foregroundStyle(foreground)
+                .lineSpacing(lineSpacing)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private func codeSection(code: String, language: String?) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if let language, !language.isEmpty {
+                Text(language)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(CodexPalette.subtleText)
+                    .textCase(.uppercase)
+            }
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                Text(code)
+                    .font(.system(size: 13, weight: .regular, design: .monospaced))
+                    .foregroundStyle(CodexPalette.foreground)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .textSelection(.enabled)
+            }
+        }
+        .padding(14)
+        .background(CodexPalette.sidebar.opacity(0.72), in: RoundedRectangle(cornerRadius: 18))
+        .overlay(
+            RoundedRectangle(cornerRadius: 18)
+                .stroke(CodexPalette.border, lineWidth: 1)
+        )
+    }
+}
+
+private enum MarkdownSegment: Hashable {
+    case markdown(String)
+    case codeBlock(String, language: String?)
+
+    static func parse(_ source: String) -> [MarkdownSegment] {
+        guard !source.isEmpty else { return [.markdown("")] }
+
+        let normalized = source.replacingOccurrences(of: "\r\n", with: "\n")
+        let lines = normalized.split(separator: "\n", omittingEmptySubsequences: false)
+
+        var segments: [MarkdownSegment] = []
+        var markdownBuffer: [String] = []
+        var codeBuffer: [String] = []
+        var inCodeBlock = false
+        var codeLanguage: String?
+
+        func flushMarkdown() {
+            guard !markdownBuffer.isEmpty else { return }
+            let value = markdownBuffer.joined(separator: "\n")
+            if !value.isEmpty {
+                segments.append(.markdown(value))
+            }
+            markdownBuffer.removeAll(keepingCapacity: true)
+        }
+
+        func flushCode() {
+            let value = codeBuffer.joined(separator: "\n")
+            segments.append(.codeBlock(value, language: codeLanguage))
+            codeBuffer.removeAll(keepingCapacity: true)
+            codeLanguage = nil
+        }
+
+        for line in lines {
+            let rawLine = String(line)
+            if rawLine.hasPrefix("```") {
+                let marker = String(rawLine.dropFirst(3)).trimmingCharacters(in: .whitespaces)
+                if inCodeBlock {
+                    flushCode()
+                    inCodeBlock = false
+                } else {
+                    flushMarkdown()
+                    inCodeBlock = true
+                    codeLanguage = marker.isEmpty ? nil : marker
+                }
+                continue
+            }
+
+            if inCodeBlock {
+                codeBuffer.append(rawLine)
+            } else {
+                markdownBuffer.append(rawLine)
+            }
+        }
+
+        if inCodeBlock {
+            flushCode()
+        } else {
+            flushMarkdown()
+        }
+
+        return segments.isEmpty ? [.markdown(normalized)] : segments
+    }
 }
 
 private struct MetadataPill: View {
