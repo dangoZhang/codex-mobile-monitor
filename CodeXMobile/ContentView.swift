@@ -1954,7 +1954,10 @@ private struct BoardTaskCardView: View {
 
             if let runtime = task.runtime {
                 HStack(spacing: 8) {
-                    DetailBadge(text: runtime.running ? "Live" : "Recent", style: runtime.running ? .connected : .neutral)
+                    DetailBadge(
+                        text: runtime.running ? "Live" : (runtime.stale ? "Stale" : "Recent"),
+                        style: runtime.running ? .connected : (runtime.stale ? .warning : .neutral)
+                    )
                     if runtime.subagentCount > 0 {
                         DetailBadge(text: "\(runtime.subagentCount) SubAgents", style: .warning)
                     }
@@ -2016,7 +2019,10 @@ private struct BoardThreadCardView: View {
                 }
                 Spacer()
                 if let runtime = thread.runtime {
-                    DetailBadge(text: runtime.running ? "Live" : "Recent", style: runtime.running ? .connected : .neutral)
+                    DetailBadge(
+                        text: runtime.running ? "Live" : (runtime.stale ? "Stale" : "Recent"),
+                        style: runtime.running ? .connected : (runtime.stale ? .warning : .neutral)
+                    )
                 }
                 if let task = thread.task {
                     DetailBadge(text: task.statusLabel, style: task.statusStyle)

@@ -437,6 +437,8 @@ struct BoardRuntimeSnapshot: Decodable, Hashable {
     let sessionCount: Int
     let subagentCount: Int
     let running: Bool
+    let stale: Bool
+    let staleReason: String?
     let updatedAt: Date?
     let gitBranch: String?
     let latestTitle: String?
@@ -449,6 +451,8 @@ struct BoardRuntimeSnapshot: Decodable, Hashable {
         case sessionCount = "session_count"
         case subagentCount = "subagent_count"
         case running
+        case stale
+        case staleReason = "stale_reason"
         case updatedAt = "updated_at"
         case gitBranch = "git_branch"
         case latestTitle = "latest_title"

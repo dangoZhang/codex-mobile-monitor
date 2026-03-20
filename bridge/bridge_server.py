@@ -65,6 +65,26 @@ def unix_to_iso(value: int | float | None) -> str:
     return datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
+def parse_iso_datetime(value: str | None) -> datetime | None:
+    cleaned = str(value or "").strip()
+    if not cleaned:
+        return None
+    try:
+        return datetime.fromisoformat(cleaned.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def parse_board_log_timestamp(value: str | None) -> datetime | None:
+    cleaned = str(value or "").strip()
+    if not cleaned:
+        return None
+    try:
+        return datetime.strptime(cleaned, "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
 def role_event_type(role: str) -> str:
     if role == "user":
         return "user.message.created"
@@ -475,6 +495,7 @@ class ChatSession:
     rollout_path: str | None = None
     model_provider: str | None = None
     cli_version: str | None = None
+    first_user_message: str | None = None
     parent_thread_id: str | None = None
     source_depth: int | None = None
     agent_nickname: str | None = None
@@ -516,6 +537,7 @@ class ChatSession:
             "rollout_path": self.rollout_path,
             "model_provider": self.model_provider,
             "cli_version": self.cli_version,
+            "first_user_message": self.first_user_message,
             "parent_thread_id": self.parent_thread_id,
             "source_depth": self.source_depth,
             "agent_nickname": self.agent_nickname,
@@ -640,7 +662,11 @@ def read_board_runtime_sessions_from_sqlite(
     try:
         cursor = connection.cursor()
         board_path = Path(board_root).expanduser()
-        targets = [str(path) for path in board_scope_paths(board_path, target_repo_root, worktree_root)]
+        targets: list[str] = []
+        for path in board_scope_paths(board_path, target_repo_root, worktree_root):
+            for alias in sorted(path_alias_strings(path)):
+                if alias not in targets:
+                    targets.append(alias)
 
         where_clauses = ["(cwd = ? OR cwd LIKE ?)"] * len(targets)
         parameters: list[Any] = []
@@ -938,26 +964,48 @@ def board_scope_paths(
     target_repo_root: str | None,
     worktree_root: str | None = None,
 ) -> list[Path]:
-    targets: list[Path] = [board_root, board_root.parent]
+    targets: list[Path] = []
     extra_roots = [
+        str(board_root),
         target_repo_root,
         str(Path(target_repo_root).expanduser() / ".codex-worktrees") if target_repo_root else None,
         worktree_root,
-        str(board_root.parent / ".codex-worktrees"),
+        str(board_root.parent / ".codex-worktrees")
+        if os.environ.get("CODEX_BRIDGE_INCLUDE_LEGACY_WORKTREE_ROOTS", "1") != "0"
+        else None,
+        str(board_root.parent)
+        if os.environ.get("CODEX_BRIDGE_INCLUDE_BOARD_PARENT_ROOT", "0") == "1"
+        else None,
     ]
 
     seen: set[Path] = set()
     for raw in extra_roots:
-        cleaned = str(raw or "").strip()
+        for alias in path_alias_strings(str(raw or "")):
+            path = Path(alias)
+            if path in seen:
+                continue
+            seen.add(path)
+            targets.append(path)
+    return targets
+
+
+def path_alias_strings(raw_path: str | Path) -> set[str]:
+    path = raw_path if isinstance(raw_path, Path) else Path(str(raw_path)).expanduser()
+    candidates = {str(path)}
+    with contextlib.suppress(Exception):
+        candidates.add(str(path.resolve()))
+
+    aliases: set[str] = set()
+    for candidate in candidates:
+        cleaned = candidate.strip()
         if not cleaned:
             continue
-        path = Path(cleaned).expanduser()
-        resolved = path.resolve() if path.exists() else path
-        if resolved in seen:
-            continue
-        seen.add(resolved)
-        targets.append(resolved)
-    return targets
+        aliases.add(cleaned)
+        if cleaned.startswith("/private/"):
+            aliases.add(cleaned.removeprefix("/private"))
+        elif cleaned.startswith("/var/") or cleaned.startswith("/tmp/"):
+            aliases.add(f"/private{cleaned}")
+    return {item for item in aliases if item}
 
 
 def path_belongs_to_board_scope(
@@ -1241,6 +1289,35 @@ def serialize_board_task(
     }
 
 
+def annotate_runtime_snapshot(
+    runtime: dict[str, Any] | None,
+    latest_log: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if runtime is None:
+        return None
+
+    annotated = dict(runtime)
+    updated_at = parse_iso_datetime(str(runtime.get("updated_at") or ""))
+    latest_log_dt = parse_board_log_timestamp(str((latest_log or {}).get("timestamp") or ""))
+    stale = False
+    stale_reason: str | None = None
+
+    if updated_at and latest_log_dt:
+        delta_seconds = (latest_log_dt - updated_at.astimezone(timezone.utc)).total_seconds()
+        if delta_seconds > 12 * 3600:
+            stale = True
+            stale_reason = "log_newer"
+    elif updated_at and not bool(runtime.get("running")):
+        age = datetime.now(timezone.utc) - updated_at.astimezone(timezone.utc)
+        if age.total_seconds() > 72 * 3600:
+            stale = True
+            stale_reason = "aged_out"
+
+    annotated["stale"] = stale
+    annotated["stale_reason"] = stale_reason
+    return annotated
+
+
 def read_board_snapshot(board_root: Path, session_summaries: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     task_board_path = board_root / "TASK_BOARD.md"
     threads_path = board_root / "THREADS.json"
@@ -1278,7 +1355,10 @@ def read_board_snapshot(board_root: Path, session_summaries: list[dict[str, Any]
                 thread_index.get(task.thread),
                 logs["latest"].get(task.thread),
                 branch_snapshots.get(task.thread),
-                runtime_index.get(task.thread),
+                annotate_runtime_snapshot(
+                    runtime_index.get(task.thread),
+                    logs["latest"].get(task.thread),
+                ),
             )
             for task in tasks
             if task.status == status
@@ -1310,7 +1390,10 @@ def read_board_snapshot(board_root: Path, session_summaries: list[dict[str, Any]
                         row,
                         logs["latest"].get(thread_id),
                         branch_snapshots.get(thread_id),
-                        runtime_index.get(thread_id),
+                        annotate_runtime_snapshot(
+                            runtime_index.get(thread_id),
+                            logs["latest"].get(thread_id),
+                        ),
                     )
                     if selected_task is not None
                     else None
@@ -1319,7 +1402,10 @@ def read_board_snapshot(board_root: Path, session_summaries: list[dict[str, Any]
                 "runtime_start": logs["kickoff_latest"].get(thread_id),
                 "last_invocation": logs["last_invocation"].get(thread_id),
                 "branches": branch_snapshots.get(thread_id),
-                "runtime": runtime_index.get(thread_id),
+                "runtime": annotate_runtime_snapshot(
+                    runtime_index.get(thread_id),
+                    logs["latest"].get(thread_id),
+                ),
             }
         )
 
@@ -1650,7 +1736,7 @@ class SessionStore:
             historical = await asyncio.to_thread(
                 read_board_runtime_sessions_from_sqlite,
                 self.threads_db_path,
-                max(self.scan_limit * 50, 3000),
+                max(self.scan_limit * 25, 1500),
                 self.allowed_sources,
                 str(board_root),
                 target_repo_root,
@@ -1661,7 +1747,12 @@ class SessionStore:
         for session in live_sessions:
             session_id = session.get("id")
             if isinstance(session_id, str):
-                merged[session_id] = session
+                existing = merged.get(session_id, {})
+                merged[session_id] = {
+                    **existing,
+                    **session,
+                    "first_user_message": session.get("first_user_message") or existing.get("first_user_message"),
+                }
 
         return list(merged.values())
 
@@ -1797,6 +1888,7 @@ class SessionStore:
                 session.rollout_path,
                 session.model_provider,
                 session.cli_version,
+                session.first_user_message,
                 session.parent_thread_id,
                 session.source_depth,
                 session.agent_nickname,
@@ -1817,6 +1909,7 @@ class SessionStore:
             session.rollout_path = record.rollout_path
             session.model_provider = record.model_provider
             session.cli_version = record.cli_version
+            session.first_user_message = record.first_user_message
             session.parent_thread_id = record.parent_thread_id
             session.source_depth = record.source_depth
             session.agent_nickname = record.agent_nickname
@@ -1835,6 +1928,7 @@ class SessionStore:
                 session.rollout_path,
                 session.model_provider,
                 session.cli_version,
+                session.first_user_message,
                 session.parent_thread_id,
                 session.source_depth,
                 session.agent_nickname,
