@@ -1005,6 +1005,10 @@ def match_thread_identity(session: dict[str, Any], thread_def: dict[str, Any]) -
     best = 0
     thread_id = str(thread_def.get("id") or "").strip().lower()
     if thread_id:
+        if re.search(rf"\byou are {re.escape(thread_id)}\b", raw_text):
+            best = max(best, 900)
+        if re.search(rf"\bact as [^\n]*\b{re.escape(thread_id)}\b", raw_text):
+            best = max(best, 850)
         if re.search(rf"(?<!codex/)\b{re.escape(thread_id)}\b(?!-)", raw_text):
             best = max(best, 500)
 

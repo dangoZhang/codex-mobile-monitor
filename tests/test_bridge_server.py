@@ -303,6 +303,7 @@ class BridgeServerTests(unittest.TestCase):
                 {"id": "thread1", "slot": "01", "name": "01-Backbone", "role": "Backend"},
                 {"id": "thread3", "slot": "03", "name": "03-Review", "role": "Review Gate"},
                 {"id": "thread4", "slot": "04", "name": "04-Test", "role": "Test / Experiment"},
+                {"id": "thread6", "slot": "06", "name": "06-Paper", "role": "Validation / Paper"},
             ]
             sessions = [
                 {
@@ -337,6 +338,17 @@ class BridgeServerTests(unittest.TestCase):
                     "running": False,
                     "last_message_preview": "benchmark case",
                 },
+                {
+                    "id": "thread6-live",
+                    "title": "You are thread6.",
+                    "first_user_message": "H-T1-T6-AUTO submitted for thread1 commit abc123.",
+                    "cwd": str(target_repo),
+                    "git_branch": "codex/thread1-default-skill",
+                    "updated_at": "2026-03-21T01:03:00.000Z",
+                    "source_kind": "vscode",
+                    "running": False,
+                    "last_message_preview": "auto dispatch",
+                },
             ]
 
             runtime = build_board_runtime_index(
@@ -350,6 +362,7 @@ class BridgeServerTests(unittest.TestCase):
             self.assertEqual(runtime["thread1"]["latest_title"], "Backend coding")
             self.assertEqual(runtime["thread3"]["latest_title"], "You are acting as 03-Review for this repository.")
             self.assertEqual(runtime["thread4"]["latest_title"], "Benchmark worker")
+            self.assertEqual(runtime["thread6"]["latest_title"], "You are thread6.")
             self.assertTrue(runtime["thread1"]["running"])
 
 
