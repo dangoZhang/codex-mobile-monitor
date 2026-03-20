@@ -1034,6 +1034,11 @@ def normalize_identity_text(value: str) -> str:
 
 
 def build_session_match_text(session: dict[str, Any]) -> tuple[str, str]:
+    cached_raw = session.get("_board_match_raw_text")
+    cached_normalized = session.get("_board_match_normalized_text")
+    if isinstance(cached_raw, str) and isinstance(cached_normalized, str):
+        return cached_raw, cached_normalized
+
     parts = [
         session.get("title"),
         session.get("first_user_message"),
@@ -1042,22 +1047,46 @@ def build_session_match_text(session: dict[str, Any]) -> tuple[str, str]:
         session.get("_match_text"),
     ]
     raw_text = "\n".join(str(part).lower() for part in parts if str(part or "").strip())
-    return raw_text, normalize_identity_text(raw_text)
+    normalized_text = normalize_identity_text(raw_text)
+    session["_board_match_raw_text"] = raw_text
+    session["_board_match_normalized_text"] = normalized_text
+    return raw_text, normalized_text
+
+
+def build_session_match_cache(session: dict[str, Any]) -> None:
+    if isinstance(session.get("_board_match_lines"), tuple) and isinstance(
+        session.get("_board_match_thread_ids"),
+        set,
+    ):
+        return
+
+    raw_text, _normalized_text = build_session_match_text(session)
+    session["_board_match_lines"] = tuple(
+        line.strip()
+        for line in raw_text.splitlines()
+        if line.strip()
+    )
+    session["_board_match_thread_ids"] = set(
+        re.findall(r"(?<!codex/)\bthread\d+\b(?!-)", raw_text)
+    )
 
 
 def match_thread_identity(session: dict[str, Any], thread_def: dict[str, Any]) -> int:
     raw_text, normalized_text = build_session_match_text(session)
     if not raw_text and not normalized_text:
         return 0
+    build_session_match_cache(session)
+    raw_lines = session.get("_board_match_lines")
+    standalone_thread_ids = session.get("_board_match_thread_ids")
 
     best = 0
     thread_id = str(thread_def.get("id") or "").strip().lower()
     if thread_id:
-        if re.search(rf"\byou are {re.escape(thread_id)}\b", raw_text):
+        if f"you are {thread_id}" in raw_text:
             best = max(best, 900)
-        if re.search(rf"\bact as [^\n]*\b{re.escape(thread_id)}\b", raw_text):
+        if isinstance(raw_lines, tuple) and any("act as" in line and thread_id in line for line in raw_lines):
             best = max(best, 850)
-        if re.search(rf"(?<!codex/)\b{re.escape(thread_id)}\b(?!-)", raw_text):
+        if isinstance(standalone_thread_ids, set) and thread_id in standalone_thread_ids:
             best = max(best, 500)
 
     name = str(thread_def.get("name") or "").strip()
@@ -1106,6 +1135,8 @@ def build_board_runtime_index(
         cwd = str(session.get("cwd") or "")
         if not path_belongs_to_board_scope(cwd, board_root, target_repo_root, worktree_root):
             continue
+
+        build_session_match_cache(session)
 
         identity_matches = [
             (match_thread_identity(session, thread_index[thread_id]), thread_id)
