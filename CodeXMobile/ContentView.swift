@@ -1,4 +1,6 @@
+import PhotosUI
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct ContentView: View {
     @StateObject private var monitorState = AppState()
@@ -398,6 +400,10 @@ private struct ShellSidebarView: View {
 private struct MonitorWorkspaceDetailView: View {
     @ObservedObject var state: AppState
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    @State private var isAttachmentDialogPresented = false
+    @State private var isFileImporterPresented = false
+    @State private var isPhotoPickerPresented = false
+    @State private var selectedPhotoItems: [PhotosPickerItem] = []
 
     var body: some View {
         ZStack {
@@ -412,6 +418,35 @@ private struct MonitorWorkspaceDetailView: View {
         .safeAreaInset(edge: .bottom) {
             if state.selectedSessionID != nil {
                 composerDock
+            }
+        }
+        .confirmationDialog("添加附件", isPresented: $isAttachmentDialogPresented, titleVisibility: .visible) {
+            Button("照片或图片") {
+                isPhotoPickerPresented = true
+            }
+            Button("文件") {
+                isFileImporterPresented = true
+            }
+            Button("取消", role: .cancel) {}
+        }
+        .photosPicker(
+            isPresented: $isPhotoPickerPresented,
+            selection: $selectedPhotoItems,
+            maxSelectionCount: 10,
+            matching: .images
+        )
+        .fileImporter(
+            isPresented: $isFileImporterPresented,
+            allowedContentTypes: [.item],
+            allowsMultipleSelection: true
+        ) { result in
+            handleFileImport(result)
+        }
+        .onChange(of: selectedPhotoItems) { _, newItems in
+            guard !newItems.isEmpty else { return }
+            Task {
+                await importSelectedPhotos(newItems)
+                selectedPhotoItems = []
             }
         }
         .navigationTitle(state.title)
@@ -460,6 +495,10 @@ private struct MonitorWorkspaceDetailView: View {
                 Spacer()
             }
 
+            if !state.draftAttachments.isEmpty {
+                attachmentTray
+            }
+
             HStack(alignment: .bottom, spacing: 12) {
                 ZStack(alignment: .topLeading) {
                     TextEditor(text: $state.draft)
@@ -497,30 +536,78 @@ private struct MonitorWorkspaceDetailView: View {
                 .disabled(
                     state.isRunning ||
                     !state.bridgeReplyAvailable ||
-                    state.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    !canSendDraft
                 )
             }
 
             HStack(spacing: 14) {
-                Image(systemName: "plus")
-                    .font(.system(size: 18, weight: .regular))
-                    .foregroundStyle(CodexPalette.muted)
+                Button {
+                    isAttachmentDialogPresented = true
+                } label: {
+                    Image(systemName: "plus")
+                        .font(.system(size: 18, weight: .regular))
+                        .foregroundStyle(CodexPalette.muted)
+                }
+                .buttonStyle(.plain)
+                .disabled(!state.bridgeReplyAvailable || state.isRunning)
 
-                Label(state.currentModelProvider?.uppercased() ?? "GPT-5.4", systemImage: "chevron.down")
-                    .labelStyle(.titleAndIcon)
-                    .font(.system(size: 14, weight: .medium))
-                    .foregroundStyle(CodexPalette.mutedBright)
+                Menu {
+                    ForEach(ComposerModelOption.allCases) { option in
+                        Button {
+                            state.updateSelectedModel(option)
+                        } label: {
+                            HStack {
+                                Text(option.title)
+                                if state.selectedModel == option {
+                                    Spacer()
+                                    Image(systemName: "checkmark")
+                                }
+                            }
+                        }
+                    }
+                } label: {
+                    ComposerMenuLabel(
+                        title: modelSelectionTitle,
+                        systemImage: "chevron.down",
+                        tint: CodexPalette.mutedBright
+                    )
+                }
+                .disabled(!state.bridgeReplyAvailable || state.isRunning)
 
-                Label(state.bridgeReplyAvailable ? "完全访问权限" : "只读监督", systemImage: "shield")
-                    .labelStyle(.titleAndIcon)
-                    .font(.system(size: 14, weight: .medium))
-                    .foregroundStyle(state.bridgeReplyAvailable ? CodexPalette.warning : CodexPalette.muted)
+                Menu {
+                    ForEach(ComposerAccessMode.allCases) { mode in
+                        Button {
+                            state.updateSelectedAccessMode(mode)
+                        } label: {
+                            HStack {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(mode.title)
+                                    Text(mode.subtitle)
+                                        .font(.system(size: 11, weight: .regular))
+                                }
+                                if state.selectedAccessMode == mode {
+                                    Spacer()
+                                    Image(systemName: "checkmark")
+                                }
+                            }
+                        }
+                    }
+                } label: {
+                    ComposerMenuLabel(
+                        title: state.selectedAccessMode.title,
+                        systemImage: "shield",
+                        tint: accessModeTint
+                    )
+                }
+                .disabled(!state.bridgeReplyAvailable || state.isRunning)
 
                 Spacer()
 
-                Image(systemName: "mic")
-                    .font(.system(size: 17, weight: .regular))
-                    .foregroundStyle(CodexPalette.muted)
+                if !state.draftAttachments.isEmpty {
+                    Text("\(state.draftAttachments.count) 个附件")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(CodexPalette.subtleText)
+                }
             }
         }
         .padding(16)
@@ -542,13 +629,79 @@ private struct MonitorWorkspaceDetailView: View {
             return "正在监督这条桌面线程的运行状态"
         }
         if state.bridgeReplyAvailable {
-            return "回复会继续写入同一个桌面线程"
+            return "回复会继续写入同一个桌面线程，可切换模型、权限并附加图片或文件"
         }
         return "当前线程只支持监督，不允许从移动端回写"
     }
 
     private var contentHorizontalPadding: CGFloat {
         horizontalSizeClass == .compact ? 18 : 28
+    }
+
+    private var canSendDraft: Bool {
+        !state.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !state.draftAttachments.isEmpty
+    }
+
+    private var modelSelectionTitle: String {
+        if state.selectedModel == .automatic {
+            return state.currentModelProvider?.uppercased() ?? ComposerModelOption.automatic.title
+        }
+        return state.selectedModel.title
+    }
+
+    private var accessModeTint: Color {
+        switch state.selectedAccessMode {
+        case .readOnly:
+            return CodexPalette.muted
+        case .workspaceWrite:
+            return CodexPalette.warning
+        case .dangerFullAccess:
+            return CodexPalette.error
+        }
+    }
+
+    private var attachmentTray: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 10) {
+                ForEach(state.draftAttachments) { attachment in
+                    DraftAttachmentChip(attachment: attachment) {
+                        state.removeAttachment(id: attachment.id)
+                    }
+                }
+            }
+        }
+    }
+
+    private func handleFileImport(_ result: Result<[URL], Error>) {
+        do {
+            let urls = try result.get()
+            try state.importAttachments(from: urls)
+            state.errorMessage = nil
+        } catch {
+            state.errorMessage = error.localizedDescription
+        }
+    }
+
+    private func importSelectedPhotos(_ items: [PhotosPickerItem]) async {
+        for (index, item) in items.enumerated() {
+            do {
+                guard let data = try await item.loadTransferable(type: Data.self) else {
+                    continue
+                }
+                let contentType = item.supportedContentTypes.first
+                let mimeType = contentType?.preferredMIMEType ?? "image/jpeg"
+                let fileExtension = contentType?.preferredFilenameExtension ?? "jpg"
+                try state.addAttachment(
+                    data: data,
+                    suggestedName: "photo-\(index + 1).\(fileExtension)",
+                    contentType: mimeType,
+                    isImage: true
+                )
+                state.errorMessage = nil
+            } catch {
+                state.errorMessage = error.localizedDescription
+            }
+        }
     }
 
     private static let time: DateFormatter = {
@@ -1120,9 +1273,12 @@ private struct MonitorPageView: View {
                         .fixedSize(horizontal: false, vertical: true)
 
                     HStack(spacing: 8) {
-                        DetailBadge(text: "Desktop", style: .neutral)
+                        DetailBadge(text: state.bridgeReplyAvailable ? "Desktop" : state.currentSourceKind.uppercased(), style: .neutral)
                         DetailBadge(text: state.isRunning ? "Running" : "Monitoring", style: state.isRunning ? .connected : .neutral)
-                        DetailBadge(text: state.currentSource.uppercased(), style: .neutral)
+                        DetailBadge(text: state.currentSourceKind.uppercased(), style: .neutral)
+                        if let agentNickname = state.currentAgentNickname, !agentNickname.isEmpty {
+                            DetailBadge(text: agentNickname, style: .warning)
+                        }
                     }
                 }
 
@@ -1150,6 +1306,12 @@ private struct MonitorPageView: View {
                     MetadataPill(title: "Provider", value: state.currentModelProvider ?? "unknown")
                     MetadataPill(title: "CLI", value: state.currentCLIVersion ?? "unknown")
                     MetadataPill(title: "Data", value: state.currentDataSource)
+                    if let gitBranch = state.currentGitBranch, !gitBranch.isEmpty {
+                        MetadataPill(title: "Branch", value: gitBranch)
+                    }
+                    if let agentRole = state.currentAgentRole, !agentRole.isEmpty {
+                        MetadataPill(title: "Agent", value: agentRole)
+                    }
                     MetadataPill(title: "Thread", value: state.selectedSessionID ?? "unknown")
                 }
             }
@@ -1158,8 +1320,14 @@ private struct MonitorPageView: View {
                 if let cwd = state.currentCWD, !cwd.isEmpty {
                     ProvenanceRow(label: "Workspace", value: cwd)
                 }
+                if let parentThreadID = state.currentParentThreadID, !parentThreadID.isEmpty {
+                    ProvenanceRow(label: "Parent Thread", value: parentThreadID)
+                }
                 if let rolloutPath = state.currentRolloutPath, !rolloutPath.isEmpty {
                     ProvenanceRow(label: "Rollout", value: rolloutPath)
+                }
+                if !state.currentSource.isEmpty, state.currentSource != state.currentSourceKind {
+                    ProvenanceRow(label: "Source", value: state.currentSource)
                 }
             }
         }
@@ -1423,7 +1591,13 @@ private struct SessionRowView: View {
                         .lineLimit(2)
 
                     HStack(spacing: 8) {
-                        DetailBadge(text: "Desktop", style: .neutral)
+                        DetailBadge(text: session.desktopThread ? "Desktop" : (session.sourceKind ?? session.source).uppercased(), style: .neutral)
+                        if session.sourceKind == "subagent" {
+                            DetailBadge(
+                                text: session.agentRole?.isEmpty == false ? (session.agentRole ?? "SubAgent") : "SubAgent",
+                                style: .warning
+                            )
+                        }
                         DetailBadge(text: session.running ? "Live" : "Idle", style: session.running ? .connected : .neutral)
                     }
                 }
@@ -1451,7 +1625,7 @@ private struct SessionRowView: View {
             }
 
             HStack {
-                Text(session.modelProvider?.uppercased() ?? session.source.uppercased())
+                Text(sessionRowFootnote)
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(CodexPalette.subtleText)
                 Spacer()
@@ -1470,6 +1644,17 @@ private struct SessionRowView: View {
 
     private var backgroundShape: RoundedRectangle {
         RoundedRectangle(cornerRadius: 20, style: .continuous)
+    }
+
+    private var sessionRowFootnote: String {
+        if session.sourceKind == "subagent" {
+            let nickname = session.agentNickname?.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let nickname, !nickname.isEmpty {
+                return nickname
+            }
+            return "SUBAGENT"
+        }
+        return session.modelProvider?.uppercased() ?? session.sourceKind?.uppercased() ?? session.source.uppercased()
     }
 
     private static let relative: RelativeDateTimeFormatter = {
@@ -1750,14 +1935,38 @@ private struct BoardTaskCardView: View {
                 .fixedSize(horizontal: false, vertical: true)
 
             if let latestLog = task.latestLog {
+                HStack(spacing: 8) {
+                    DetailBadge(text: latestLog.type.uppercased(), style: boardLogStyle(latestLog.type))
+                    Text(latestLog.timestamp)
+                        .font(.system(size: 11, weight: .regular, design: .monospaced))
+                        .foregroundStyle(CodexPalette.subtleText)
+                }
                 Text(latestLog.message)
+                    .font(.system(size: 12, weight: .regular))
+                    .foregroundStyle(CodexPalette.mutedBright)
+                    .lineLimit(3)
+            } else if let runtime = task.runtime, let preview = runtime.lastMessagePreview, !preview.isEmpty {
+                Text(preview)
                     .font(.system(size: 12, weight: .regular))
                     .foregroundStyle(CodexPalette.mutedBright)
                     .lineLimit(3)
             }
 
+            if let runtime = task.runtime {
+                HStack(spacing: 8) {
+                    DetailBadge(text: runtime.running ? "Live" : "Recent", style: runtime.running ? .connected : .neutral)
+                    if runtime.subagentCount > 0 {
+                        DetailBadge(text: "\(runtime.subagentCount) SubAgents", style: .warning)
+                    }
+                }
+            }
+
             if let branches = task.branches {
                 Text("Local \(branches.local.count) · Remote \(branches.remote.count)")
+                    .font(.system(size: 11, weight: .regular, design: .monospaced))
+                    .foregroundStyle(CodexPalette.subtleText)
+            } else if let runtime = task.runtime, let gitBranch = runtime.gitBranch, !gitBranch.isEmpty {
+                Text(gitBranch)
                     .font(.system(size: 11, weight: .regular, design: .monospaced))
                     .foregroundStyle(CodexPalette.subtleText)
             }
@@ -1806,6 +2015,9 @@ private struct BoardThreadCardView: View {
                         .foregroundStyle(CodexPalette.muted)
                 }
                 Spacer()
+                if let runtime = thread.runtime {
+                    DetailBadge(text: runtime.running ? "Live" : "Recent", style: runtime.running ? .connected : .neutral)
+                }
                 if let task = thread.task {
                     DetailBadge(text: task.statusLabel, style: task.statusStyle)
                 } else {
@@ -1821,7 +2033,18 @@ private struct BoardThreadCardView: View {
             }
 
             if let lastLog = thread.lastLog {
+                HStack(spacing: 8) {
+                    DetailBadge(text: lastLog.type.uppercased(), style: boardLogStyle(lastLog.type))
+                    Text(lastLog.timestamp)
+                        .font(.system(size: 11, weight: .regular, design: .monospaced))
+                        .foregroundStyle(CodexPalette.subtleText)
+                }
                 Text(lastLog.message)
+                    .font(.system(size: 12, weight: .regular))
+                    .foregroundStyle(CodexPalette.muted)
+                    .lineLimit(3)
+            } else if let runtime = thread.runtime, let preview = runtime.lastMessagePreview, !preview.isEmpty {
+                Text(preview)
                     .font(.system(size: 12, weight: .regular))
                     .foregroundStyle(CodexPalette.muted)
                     .lineLimit(3)
@@ -1838,6 +2061,17 @@ private struct BoardThreadCardView: View {
                     Text("L\(branches.local.count)/R\(branches.remote.count)")
                         .font(.system(size: 11, weight: .regular, design: .monospaced))
                         .foregroundStyle(CodexPalette.subtleText)
+                } else if let runtime = thread.runtime {
+                    Text("S\(runtime.sessionCount)/A\(runtime.subagentCount)")
+                        .font(.system(size: 11, weight: .regular, design: .monospaced))
+                        .foregroundStyle(CodexPalette.subtleText)
+                }
+
+                if let runtime = thread.runtime, let gitBranch = runtime.gitBranch, !gitBranch.isEmpty {
+                    Text(gitBranch)
+                        .font(.system(size: 11, weight: .regular, design: .monospaced))
+                        .foregroundStyle(CodexPalette.subtleText)
+                        .lineLimit(1)
                 }
             }
         }
@@ -1847,6 +2081,19 @@ private struct BoardThreadCardView: View {
             RoundedRectangle(cornerRadius: 20)
                 .stroke(CodexPalette.border, lineWidth: 1)
         )
+    }
+}
+
+private func boardLogStyle(_ kind: String) -> DetailBadge.Style {
+    switch kind.lowercased() {
+    case "blocker":
+        return .error
+    case "kickoff":
+        return .connected
+    case "handoff":
+        return .warning
+    default:
+        return .neutral
     }
 }
 
@@ -2006,11 +2253,26 @@ private struct MessageRowView: View {
         let tool = message.toolName ?? "tool"
         let lines = message.text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
         let firstLine = lines.first ?? ""
-        if tool == "exec_command" {
+        if tool == "exec_command" || tool == "write_stdin" {
             return firstLine.isEmpty ? "已运行命令" : "已运行 \(firstLine)"
         }
         if tool == "apply_patch" {
             return "已应用补丁"
+        }
+        if tool == "wait_agent" {
+            return "已等待子 Agent"
+        }
+        if tool == "spawn_agent" {
+            return "已创建子 Agent"
+        }
+        if tool == "send_input" {
+            return "已向子 Agent 发送输入"
+        }
+        if tool == "close_agent" {
+            return "已关闭子 Agent"
+        }
+        if tool == "web_search" {
+            return firstLine.isEmpty ? "已执行网页检索" : "已执行 \(firstLine)"
         }
         return "已运行 \(tool)"
     }
@@ -2018,7 +2280,7 @@ private struct MessageRowView: View {
     private var toolDetailText: String? {
         let lines = message.text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
         guard !lines.isEmpty else { return nil }
-        if message.toolName == "exec_command" {
+        if message.toolName == "exec_command" || message.toolName == "write_stdin" || message.toolName == "web_search" {
             let trailing = Array(lines.dropFirst()).joined(separator: "\n")
             return trailing.isEmpty ? nil : trailing
         }
@@ -2220,6 +2482,58 @@ private struct ConnectionBadge: View {
 
     var body: some View {
         DetailBadge(text: text, style: style)
+    }
+}
+
+private struct ComposerMenuLabel: View {
+    let title: String
+    let systemImage: String
+    let tint: Color
+
+    var body: some View {
+        Label(title, systemImage: systemImage)
+            .labelStyle(.titleAndIcon)
+            .font(.system(size: 14, weight: .medium))
+            .foregroundStyle(tint)
+    }
+}
+
+private struct DraftAttachmentChip: View {
+    let attachment: DraftAttachment
+    let onRemove: () -> Void
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: attachment.isImage ? "photo" : "doc")
+                .font(.system(size: 14, weight: .medium))
+                .foregroundStyle(attachment.isImage ? CodexPalette.accent : CodexPalette.mutedBright)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(attachment.displayName)
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(CodexPalette.foreground)
+                    .lineLimit(1)
+                Text(ByteCountFormatter.string(fromByteCount: attachment.byteCount, countStyle: .file))
+                    .font(.system(size: 11, weight: .regular))
+                    .foregroundStyle(CodexPalette.subtleText)
+            }
+
+            Button(action: onRemove) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(CodexPalette.muted)
+                    .frame(width: 20, height: 20)
+                    .background(CodexPalette.canvas, in: Circle())
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
+        .background(CodexPalette.canvas, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(CodexPalette.border, lineWidth: 1)
+        )
     }
 }
 

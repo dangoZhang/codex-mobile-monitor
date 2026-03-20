@@ -4,7 +4,9 @@ import asyncio
 import base64
 import contextlib
 import json
+import mimetypes
 import os
+import re
 import sqlite3
 import subprocess
 import tempfile
@@ -25,6 +27,10 @@ BOARD_STATUS_TITLES = {
     "TODO": "Todo",
     "DONE": "Done",
 }
+
+UPLOAD_ROOT_NAME = ".codex-mobile-uploads"
+DEFAULT_ATTACHMENT_PROMPT = "Please inspect the uploaded files from CodeX Mobile and continue this desktop thread."
+DEFAULT_ALLOWED_SOURCE_KINDS = "vscode,app,exec,subagent"
 
 
 def utc_now() -> str:
@@ -101,6 +107,9 @@ def compact_text(value: str, line_limit: int = 6, char_limit: int = 320) -> str:
 
 
 def summarize_tool_call(name: str, arguments: Any) -> str:
+    if name == "apply_patch":
+        return "Applied patch to workspace files"
+
     parsed: dict[str, Any] | None = None
     if isinstance(arguments, str):
         parsed = maybe_parse_json(arguments)
@@ -114,14 +123,239 @@ def summarize_tool_call(name: str, arguments: Any) -> str:
             if command and workdir:
                 return f"{command}\n{workdir}"
             return command or name
-        if name == "apply_patch":
-            return "Applied patch to workspace files"
+        if name == "send_input":
+            agent_id = str(parsed.get("id") or "").strip()
+            message = compact_text(str(parsed.get("message") or ""))
+            if agent_id and message:
+                return f"send_input\n{agent_id}\n{message}"
+            return compact_text(f"send_input\n{agent_id}" if agent_id else name)
+        if name == "wait_agent":
+            ids = parsed.get("ids")
+            if isinstance(ids, list):
+                joined = "\n".join(str(item) for item in ids[:4] if str(item).strip())
+                if joined:
+                    return f"wait_agent\n{joined}"
+        if name == "spawn_agent":
+            agent_type = str(parsed.get("agent_type") or "").strip()
+            message = compact_text(str(parsed.get("message") or ""))
+            if agent_type and message:
+                return f"spawn_agent\n{agent_type}\n{message}"
+            return compact_text(f"spawn_agent\n{agent_type}" if agent_type else name)
+        if name == "close_agent":
+            agent_id = str(parsed.get("id") or "").strip()
+            return compact_text(f"close_agent\n{agent_id}" if agent_id else name)
         if name.startswith("mcp__playwright__"):
             action = name.removeprefix("mcp__playwright__").replace("_", " ")
             element = str(parsed.get("element") or "")
             return compact_text(f"{action}\n{element}" if element else action)
 
     return compact_text(name)
+
+
+def compact_json(value: Any) -> str:
+    try:
+        return compact_text(json.dumps(value, ensure_ascii=False))
+    except TypeError:
+        return compact_text(str(value))
+
+
+@dataclass(frozen=True)
+class SourceMetadata:
+    raw_text: str
+    kind: str
+    parent_thread_id: str | None = None
+    depth: int | None = None
+    agent_nickname: str | None = None
+    agent_role: str | None = None
+
+
+def parse_source_metadata(value: Any) -> SourceMetadata:
+    if isinstance(value, str):
+        cleaned = value.strip()
+        if cleaned.startswith("{") and cleaned.endswith("}"):
+            try:
+                return parse_source_metadata(json.loads(cleaned))
+            except json.JSONDecodeError:
+                pass
+        return SourceMetadata(raw_text=cleaned, kind=cleaned.lower() or "unknown")
+
+    if isinstance(value, dict):
+        raw_text = json.dumps(value, ensure_ascii=False)
+        subagent = value.get("subagent")
+        if isinstance(subagent, dict):
+            thread_spawn = subagent.get("thread_spawn")
+            if isinstance(thread_spawn, dict):
+                depth_raw = thread_spawn.get("depth")
+                return SourceMetadata(
+                    raw_text=raw_text,
+                    kind="subagent",
+                    parent_thread_id=str(thread_spawn["parent_thread_id"]) if thread_spawn.get("parent_thread_id") else None,
+                    depth=int(depth_raw) if isinstance(depth_raw, (int, float)) else None,
+                    agent_nickname=str(thread_spawn["agent_nickname"]) if thread_spawn.get("agent_nickname") else None,
+                    agent_role=str(thread_spawn["agent_role"]) if thread_spawn.get("agent_role") else None,
+                )
+        return SourceMetadata(raw_text=raw_text, kind="unknown")
+
+    if value is None:
+        return SourceMetadata(raw_text="", kind="unknown")
+    return SourceMetadata(raw_text=str(value), kind=str(value).strip().lower() or "unknown")
+
+
+def decorate_thread_title(base_title: str, source_meta: SourceMetadata) -> str:
+    title = base_title.strip() or "Untitled Thread"
+    if source_meta.kind != "subagent":
+        return title
+    nickname = source_meta.agent_nickname or "Subagent"
+    if source_meta.agent_role:
+        return f"{nickname} ({source_meta.agent_role})"
+    return nickname
+
+
+def summarize_tool_output(name: str | None, output: Any) -> str:
+    tool_name = (name or "tool").strip() or "tool"
+    text = str(output or "").strip()
+    if not text:
+        return ""
+
+    if tool_name in {"exec_command", "write_stdin"}:
+        lines = text.splitlines()
+        command = ""
+        detail_lines: list[str] = []
+        if lines and lines[0].startswith("Command: "):
+            command = lines[0].removeprefix("Command: ").strip()
+        capture_output = False
+        for line in lines[1:]:
+            if line == "Output:":
+                capture_output = True
+                continue
+            if capture_output:
+                detail_lines.append(line)
+            elif "Process running with session ID" in line or "Process exited with code" in line:
+                detail_lines.append(line.strip())
+        detail = compact_text("\n".join(line for line in detail_lines if line.strip()), line_limit=8, char_limit=1000)
+        if command and detail:
+            return f"{command}\n{detail}"
+        if command:
+            return command
+        return compact_text(text, line_limit=8, char_limit=1000)
+
+    parsed = maybe_parse_json(text)
+    if parsed:
+        if tool_name == "spawn_agent" and isinstance(parsed.get("agent_id"), str):
+            nickname = str(parsed.get("nickname") or "").strip()
+            if nickname:
+                return f"spawned {nickname}\n{parsed['agent_id']}"
+            return f"spawned agent\n{parsed['agent_id']}"
+        if tool_name == "wait_agent":
+            if parsed.get("timed_out") is True:
+                return "wait timed out"
+            status = parsed.get("status")
+            return compact_json(status if status is not None else parsed)
+        if tool_name == "close_agent":
+            previous = parsed.get("previous_status")
+            return compact_json(previous if previous is not None else parsed)
+        return compact_json(parsed)
+
+    return compact_text(text, line_limit=8, char_limit=1000)
+
+
+def summarize_web_search_call(item: dict[str, Any]) -> str:
+    action = item.get("action")
+    if not isinstance(action, dict):
+        status = str(item.get("status") or "").strip()
+        return compact_text(f"web_search\n{status}" if status else "web_search")
+
+    action_type = str(action.get("type") or "").strip()
+    if action_type == "search":
+        query = str(action.get("query") or "").strip()
+        return compact_text(f"search\n{query}" if query else "search")
+    if action_type == "open_page":
+        url = str(action.get("url") or "").strip()
+        return compact_text(f"open_page\n{url}" if url else "open_page")
+    return compact_json(action)
+
+
+def is_desktop_reply_source(source_kind: str) -> bool:
+    return source_kind in {"vscode", "app", "bridge"}
+
+
+def sanitize_filename(value: str, fallback: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", value.strip()).strip("-.")
+    return cleaned or fallback
+
+
+def normalize_access_mode(value: str | None) -> str:
+    cleaned = (value or "").strip().lower()
+    if cleaned in {"read-only", "readonly", "read_only"}:
+        return "read-only"
+    if cleaned in {"danger-full-access", "danger", "full-access", "full_access"}:
+        return "danger-full-access"
+    return "workspace-write"
+
+
+def is_image_attachment(filename: str, content_type: str | None) -> bool:
+    if (content_type or "").lower().startswith("image/"):
+        return True
+    guessed, _ = mimetypes.guess_type(filename)
+    return bool(guessed and guessed.startswith("image/"))
+
+
+def save_mobile_uploads(fields: list[Any], cwd: Path, session_id: str) -> list[dict[str, Any]]:
+    upload_dir = cwd / UPLOAD_ROOT_NAME / session_id
+    upload_dir.mkdir(parents=True, exist_ok=True)
+
+    saved: list[dict[str, Any]] = []
+    used_names: set[str] = set()
+
+    for index, field in enumerate(fields, start=1):
+        original_name = str(getattr(field, "filename", "") or f"attachment-{index}")
+        safe_name = sanitize_filename(original_name, f"attachment-{index}")
+        stem = Path(safe_name).stem or f"attachment-{index}"
+        suffix = Path(safe_name).suffix
+        candidate = safe_name
+        duplicate_index = 2
+        while candidate in used_names or (upload_dir / candidate).exists():
+            candidate = f"{stem}-{duplicate_index}{suffix}"
+            duplicate_index += 1
+
+        payload = getattr(field, "file").read()
+        destination = upload_dir / candidate
+        destination.write_bytes(payload)
+        used_names.add(candidate)
+
+        try:
+            relative_path = destination.relative_to(cwd).as_posix()
+        except ValueError:
+            relative_path = str(destination)
+
+        content_type = str(getattr(field, "content_type", "") or "")
+        saved.append(
+            {
+                "filename": candidate,
+                "original_name": original_name,
+                "path": destination,
+                "relative_path": relative_path,
+                "content_type": content_type,
+                "is_image": is_image_attachment(candidate, content_type),
+            }
+        )
+
+    return saved
+
+
+def build_mobile_prompt(text: str, attachments: list[dict[str, Any]]) -> str:
+    body = text.strip() or DEFAULT_ATTACHMENT_PROMPT
+    if not attachments:
+        return body
+
+    lines = [
+        "Files uploaded from CodeX Mobile are now available inside the current workspace:",
+    ]
+    for item in attachments:
+        kind = "image" if item["is_image"] else "file"
+        lines.append(f"- {item['original_name']} ({kind}): {item['relative_path']}")
+    lines.extend(["", "User message:", body])
+    return "\n".join(lines)
 
 
 @lru_cache(maxsize=512)
@@ -169,6 +403,8 @@ class ThreadRecord:
     thread_id: str
     title: str
     source: str
+    source_kind: str
+    git_branch: str | None
     cwd: str
     created_at: str
     updated_at: str
@@ -176,6 +412,10 @@ class ThreadRecord:
     model_provider: str | None
     cli_version: str | None
     first_user_message: str | None
+    parent_thread_id: str | None
+    source_depth: int | None
+    agent_nickname: str | None
+    agent_role: str | None
 
 
 @dataclass
@@ -185,9 +425,14 @@ class ParsedFileDelta:
     updated_at: str | None
     cwd: str | None
     source: str | None
+    source_kind: str | None
     originator: str | None
     model_provider: str | None
     cli_version: str | None
+    parent_thread_id: str | None
+    source_depth: int | None
+    agent_nickname: str | None
+    agent_role: str | None
     running: bool
     next_offset: int
     next_line_number: int
@@ -195,6 +440,7 @@ class ParsedFileDelta:
     stat_size: int
     stat_mtime_ns: int
     reset_applied: bool
+    tool_call_names: dict[str, str]
 
 
 @dataclass
@@ -220,6 +466,8 @@ class ChatSession:
     project_root: str | None = None
     project_name: str | None = None
     source: str = "bridge"
+    source_kind: str = "bridge"
+    git_branch: str | None = None
     originator: str | None = None
     imported: bool = False
     desktop_thread: bool = False
@@ -227,10 +475,15 @@ class ChatSession:
     rollout_path: str | None = None
     model_provider: str | None = None
     cli_version: str | None = None
+    parent_thread_id: str | None = None
+    source_depth: int | None = None
+    agent_nickname: str | None = None
+    agent_role: str | None = None
     bridge_reply_available: bool = True
     messages: list[ChatMessage] = field(default_factory=list)
     events: list[SessionEvent] = field(default_factory=list)
     subscribers: set[asyncio.Queue[SessionEvent]] = field(default_factory=set)
+    tool_call_names: dict[str, str] = field(default_factory=dict)
     next_seq: int = 1
     running: bool = False
     active_task: asyncio.Task[None] | None = None
@@ -254,6 +507,8 @@ class ChatSession:
             "project_root": self.project_root,
             "project_name": self.project_name,
             "source": self.source,
+            "source_kind": self.source_kind,
+            "git_branch": self.git_branch,
             "originator": self.originator,
             "imported": self.imported,
             "desktop_thread": self.desktop_thread,
@@ -261,6 +516,10 @@ class ChatSession:
             "rollout_path": self.rollout_path,
             "model_provider": self.model_provider,
             "cli_version": self.cli_version,
+            "parent_thread_id": self.parent_thread_id,
+            "source_depth": self.source_depth,
+            "agent_nickname": self.agent_nickname,
+            "agent_role": self.agent_role,
             "bridge_reply_available": self.bridge_reply_available,
             "running": self.running,
             "message_count": len(self.messages),
@@ -283,7 +542,7 @@ def read_threads_from_sqlite(db_path: Path, limit: int, allowed_sources: set[str
         cursor = connection.cursor()
         cursor.execute(
             """
-            SELECT id, title, source, cwd, created_at, updated_at, rollout_path, model_provider, cli_version, first_user_message
+            SELECT id, title, source, cwd, created_at, updated_at, rollout_path, model_provider, cli_version, first_user_message, agent_nickname, agent_role, git_branch
             FROM threads
             WHERE archived = 0
             ORDER BY updated_at DESC
@@ -294,18 +553,21 @@ def read_threads_from_sqlite(db_path: Path, limit: int, allowed_sources: set[str
         records: list[ThreadRecord] = []
         seen_ids: set[str] = set()
         for row in cursor.fetchall():
-            source = str(row["source"] or "")
-            if source not in allowed_sources:
+            source_meta = parse_source_metadata(row["source"])
+            if allowed_sources and source_meta.kind not in allowed_sources and source_meta.raw_text not in allowed_sources:
                 continue
             thread_id = str(row["id"])
             if thread_id in seen_ids:
                 continue
             seen_ids.add(thread_id)
+            base_title = str(row["title"] or row["first_user_message"] or f"Thread {thread_id[:8]}")
             records.append(
                 ThreadRecord(
                     thread_id=thread_id,
-                    title=str(row["title"] or row["first_user_message"] or f"Thread {thread_id[:8]}"),
-                    source=source,
+                    title=decorate_thread_title(base_title, source_meta),
+                    source=source_meta.raw_text,
+                    source_kind=source_meta.kind,
+                    git_branch=str(row["git_branch"]) if row["git_branch"] else None,
                     cwd=str(row["cwd"] or ""),
                     created_at=unix_to_iso(row["created_at"]),
                     updated_at=unix_to_iso(row["updated_at"]),
@@ -313,6 +575,10 @@ def read_threads_from_sqlite(db_path: Path, limit: int, allowed_sources: set[str
                     model_provider=str(row["model_provider"]) if row["model_provider"] else None,
                     cli_version=str(row["cli_version"]) if row["cli_version"] else None,
                     first_user_message=str(row["first_user_message"]) if row["first_user_message"] else None,
+                    parent_thread_id=source_meta.parent_thread_id,
+                    source_depth=source_meta.depth,
+                    agent_nickname=str(row["agent_nickname"]) if row["agent_nickname"] else source_meta.agent_nickname,
+                    agent_role=str(row["agent_role"]) if row["agent_role"] else source_meta.agent_role,
                 )
             )
             if len(records) >= limit:
@@ -356,6 +622,75 @@ def read_recent_projects_from_sqlite(db_path: Path, limit: int) -> list[dict[str
             if len(projects) >= limit:
                 break
         return projects
+    finally:
+        connection.close()
+
+
+def read_board_runtime_sessions_from_sqlite(
+    db_path: Path,
+    limit: int,
+    allowed_sources: set[str],
+    board_root: str,
+    target_repo_root: str | None,
+    worktree_root: str | None = None,
+) -> list[dict[str, Any]]:
+    uri = f"file:{db_path}?mode=ro"
+    connection = sqlite3.connect(uri, uri=True)
+    connection.row_factory = sqlite3.Row
+    try:
+        cursor = connection.cursor()
+        board_path = Path(board_root).expanduser()
+        targets = [str(path) for path in board_scope_paths(board_path, target_repo_root, worktree_root)]
+
+        where_clauses = ["(cwd = ? OR cwd LIKE ?)"] * len(targets)
+        parameters: list[Any] = []
+        for target in targets:
+            parameters.extend([target, f"{target}/%"])
+        cursor.execute(
+            f"""
+            SELECT id, title, source, cwd, updated_at, git_branch, agent_nickname, agent_role, first_user_message
+            FROM threads
+            WHERE archived = 0
+              AND cwd IS NOT NULL
+              AND cwd != ''
+              AND ({' OR '.join(where_clauses)})
+            ORDER BY updated_at DESC
+            LIMIT ?
+            """,
+            (*parameters, limit),
+        )
+
+        sessions: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        for row in cursor.fetchall():
+            thread_id = str(row["id"] or "")
+            if not thread_id or thread_id in seen_ids:
+                continue
+            source_meta = parse_source_metadata(row["source"])
+            if allowed_sources and source_meta.kind not in allowed_sources and source_meta.raw_text not in allowed_sources:
+                continue
+
+            cwd = str(row["cwd"] or "")
+            base_title = str(row["title"] or f"Thread {thread_id[:8]}")
+            sessions.append(
+                {
+                    "id": thread_id,
+                    "title": decorate_thread_title(base_title, source_meta),
+                    "source": source_meta.raw_text,
+                    "source_kind": source_meta.kind,
+                    "git_branch": str(row["git_branch"]) if row["git_branch"] else None,
+                    "cwd": cwd,
+                    "updated_at": unix_to_iso(row["updated_at"]),
+                    "parent_thread_id": source_meta.parent_thread_id,
+                    "agent_nickname": str(row["agent_nickname"]) if row["agent_nickname"] else source_meta.agent_nickname,
+                    "agent_role": str(row["agent_role"]) if row["agent_role"] else source_meta.agent_role,
+                    "first_user_message": str(row["first_user_message"] or ""),
+                    "running": False,
+                    "last_message_preview": "",
+                }
+            )
+            seen_ids.add(thread_id)
+        return sessions
     finally:
         connection.close()
 
@@ -578,32 +913,229 @@ def read_git(repo: Path, *args: str) -> str | None:
     return result.stdout.strip()
 
 
-def build_board_repo_snapshot(
-    board_root: Path,
-    thread_defs: list[dict[str, Any]],
-) -> tuple[dict[str, Any] | None, dict[str, dict[str, Any]], str | None, str | None]:
+def read_board_config(board_root: Path) -> dict[str, Any] | None:
     config_path = board_root / "coordination.config.json"
     if not config_path.exists():
-        return None, {}, None, None
-
+        return None
     try:
         raw = json.loads(config_path.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
-        return {"configured": False, "error": "invalid coordination.config.json"}, {}, None, None
+        return None
+    return raw if isinstance(raw, dict) else None
 
-    if not isinstance(raw, dict):
-        return {"configured": False, "error": "invalid coordination.config.json"}, {}, None, None
+
+def branch_matches_thread(branch_name: str, thread_id: str, persistent_branch: str | None) -> bool:
+    cleaned = branch_name.strip()
+    if not cleaned:
+        return False
+    if persistent_branch and cleaned == persistent_branch:
+        return True
+    return cleaned.startswith(f"codex/{thread_id}-")
+
+
+def board_scope_paths(
+    board_root: Path,
+    target_repo_root: str | None,
+    worktree_root: str | None = None,
+) -> list[Path]:
+    targets: list[Path] = [board_root, board_root.parent]
+    extra_roots = [
+        target_repo_root,
+        str(Path(target_repo_root).expanduser() / ".codex-worktrees") if target_repo_root else None,
+        worktree_root,
+        str(board_root.parent / ".codex-worktrees"),
+    ]
+
+    seen: set[Path] = set()
+    for raw in extra_roots:
+        cleaned = str(raw or "").strip()
+        if not cleaned:
+            continue
+        path = Path(cleaned).expanduser()
+        resolved = path.resolve() if path.exists() else path
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        targets.append(resolved)
+    return targets
+
+
+def path_belongs_to_board_scope(
+    session_cwd: str,
+    board_root: Path,
+    target_repo_root: str | None,
+    worktree_root: str | None = None,
+) -> bool:
+    cleaned = session_cwd.strip()
+    if not cleaned:
+        return False
+    path = Path(cleaned).expanduser()
+    resolved = path.resolve() if path.exists() else path
+
+    for target in board_scope_paths(board_root, target_repo_root, worktree_root):
+        if resolved == target:
+            return True
+        with contextlib.suppress(ValueError):
+            resolved.relative_to(target)
+            return True
+    return False
+
+
+def normalize_identity_text(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+
+
+def build_session_match_text(session: dict[str, Any]) -> tuple[str, str]:
+    parts = [
+        session.get("title"),
+        session.get("first_user_message"),
+        session.get("cwd"),
+        session.get("source"),
+        session.get("_match_text"),
+    ]
+    raw_text = "\n".join(str(part).lower() for part in parts if str(part or "").strip())
+    return raw_text, normalize_identity_text(raw_text)
+
+
+def match_thread_identity(session: dict[str, Any], thread_def: dict[str, Any]) -> int:
+    raw_text, normalized_text = build_session_match_text(session)
+    if not raw_text and not normalized_text:
+        return 0
+
+    best = 0
+    thread_id = str(thread_def.get("id") or "").strip().lower()
+    if thread_id:
+        if re.search(rf"(?<!codex/)\b{re.escape(thread_id)}\b(?!-)", raw_text):
+            best = max(best, 500)
+
+    name = str(thread_def.get("name") or "").strip()
+    if name:
+        lowered_name = name.lower()
+        normalized_name = normalize_identity_text(name)
+        if lowered_name in raw_text or (normalized_name and normalized_name in normalized_text):
+            best = max(best, 350)
+
+    role = str(thread_def.get("role") or "").strip()
+    if role:
+        lowered_role = role.lower()
+        normalized_role = normalize_identity_text(role)
+        if len(lowered_role) >= 8 and lowered_role in raw_text:
+            best = max(best, 180)
+        if len(normalized_role) >= 8 and normalized_role in normalized_text:
+            best = max(best, 170)
+
+    return best
+
+
+def build_board_runtime_index(
+    board_root: Path,
+    target_repo_root: str | None,
+    worktree_root: str | None,
+    thread_defs: list[dict[str, Any]],
+    session_summaries: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    config = read_board_config(board_root) or {}
+    persistent_raw = config.get("persistent_branches")
+    persistent_branches = {
+        str(thread_id): str(branch_name)
+        for thread_id, branch_name in persistent_raw.items()
+        if isinstance(thread_id, str) and isinstance(branch_name, str)
+    } if isinstance(persistent_raw, dict) else {}
+
+    thread_ids = [str(row.get("id") or "") for row in thread_defs if str(row.get("id") or "")]
+    thread_index = {
+        str(row.get("id") or ""): row
+        for row in thread_defs
+        if str(row.get("id") or "")
+    }
+    grouped: dict[str, dict[str, list[dict[str, Any]]]] = {thread_id: {} for thread_id in thread_ids}
+
+    for session in session_summaries:
+        cwd = str(session.get("cwd") or "")
+        if not path_belongs_to_board_scope(cwd, board_root, target_repo_root, worktree_root):
+            continue
+
+        identity_matches = [
+            (match_thread_identity(session, thread_index[thread_id]), thread_id)
+            for thread_id in thread_ids
+        ]
+        identity_matches = [(score, thread_id) for score, thread_id in identity_matches if score > 0]
+
+        matched_thread_id: str | None = None
+        if identity_matches:
+            identity_matches.sort(key=lambda item: (item[0], item[1]), reverse=True)
+            if len(identity_matches) == 1 or identity_matches[0][0] > identity_matches[1][0]:
+                matched_thread_id = identity_matches[0][1]
+
+        if matched_thread_id is None:
+            branch_name = str(session.get("git_branch") or "")
+            matched_thread_id = next(
+                (
+                    thread_id
+                    for thread_id in thread_ids
+                    if branch_matches_thread(branch_name, thread_id, persistent_branches.get(thread_id))
+                ),
+                None,
+            )
+        if matched_thread_id is None:
+            continue
+
+        group_id = str(session.get("parent_thread_id") or session.get("id") or "")
+        if not group_id:
+            continue
+        grouped[matched_thread_id].setdefault(group_id, []).append(session)
+
+    runtime: dict[str, dict[str, Any]] = {}
+    for thread_id, groups in grouped.items():
+        if not groups:
+            continue
+
+        selected_group = max(
+            groups.values(),
+            key=lambda items: max(str(item.get("updated_at") or "") for item in items),
+        )
+        selected_group = sorted(selected_group, key=lambda item: str(item.get("updated_at") or ""), reverse=True)
+        latest = selected_group[0]
+        runtime[thread_id] = {
+            "session_count": len(selected_group),
+            "subagent_count": sum(1 for item in selected_group if item.get("source_kind") == "subagent"),
+            "running": any(bool(item.get("running")) for item in selected_group),
+            "updated_at": latest.get("updated_at"),
+            "git_branch": latest.get("git_branch"),
+            "latest_title": latest.get("title"),
+            "last_message_preview": latest.get("last_message_preview"),
+            "source_kind": latest.get("source_kind"),
+            "agent_nickname": latest.get("agent_nickname"),
+            "agent_role": latest.get("agent_role"),
+        }
+
+    return runtime
+
+
+def build_board_repo_snapshot(
+    board_root: Path,
+    thread_defs: list[dict[str, Any]],
+) -> tuple[dict[str, Any] | None, dict[str, dict[str, Any]], str | None, str | None, str | None]:
+    raw = read_board_config(board_root)
+    if raw is None:
+        return None, {}, None, None, None
 
     target_repo_raw = raw.get("target_repo")
+    worktree_root_raw = raw.get("worktree_root")
     base_branch = str(raw.get("base_branch") or "") or None
     target_repo = Path(str(target_repo_raw)).expanduser().resolve() if target_repo_raw else None
+    worktree_root = (
+        str(Path(str(worktree_root_raw)).expanduser().resolve())
+        if worktree_root_raw
+        else None
+    )
     if target_repo is None:
-        return {"configured": False, "error": "missing target_repo"}, {}, base_branch, None
+        return {"configured": False, "error": "missing target_repo"}, {}, base_branch, None, worktree_root
     if not target_repo.exists():
         return {
             "configured": False,
             "error": f"target repo not found: {target_repo}",
-        }, {}, base_branch, str(target_repo)
+        }, {}, base_branch, str(target_repo), worktree_root
 
     local_branches = [
         line
@@ -665,6 +1197,7 @@ def build_board_repo_snapshot(
         branch_snapshots,
         base_branch,
         str(target_repo),
+        worktree_root,
     )
 
 
@@ -682,6 +1215,7 @@ def serialize_board_task(
     thread_meta: dict[str, Any] | None,
     latest_log: dict[str, Any] | None,
     branches: dict[str, Any] | None,
+    runtime: dict[str, Any] | None,
 ) -> dict[str, Any]:
     meta = thread_meta or {}
     return {
@@ -699,10 +1233,11 @@ def serialize_board_task(
         "auto_branch": bool(meta.get("auto_branch", False)),
         "latest_log": latest_log,
         "branches": branches,
+        "runtime": runtime,
     }
 
 
-def read_board_snapshot(board_root: Path) -> dict[str, Any]:
+def read_board_snapshot(board_root: Path, session_summaries: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     task_board_path = board_root / "TASK_BOARD.md"
     threads_path = board_root / "THREADS.json"
     comm_log_path = board_root / "COMM_LOG.md"
@@ -710,7 +1245,14 @@ def read_board_snapshot(board_root: Path) -> dict[str, Any]:
     tasks = parse_board_tasks(task_board_path)
     logs = parse_board_comm_log(comm_log_path)
     title = parse_board_title(board_root)
-    repo_snapshot, branch_snapshots, base_branch, target_repo_root = build_board_repo_snapshot(board_root, thread_defs)
+    repo_snapshot, branch_snapshots, base_branch, target_repo_root, worktree_root = build_board_repo_snapshot(board_root, thread_defs)
+    runtime_index = build_board_runtime_index(
+        board_root,
+        target_repo_root,
+        worktree_root,
+        thread_defs,
+        session_summaries or [],
+    )
     thread_index = {str(row.get("id") or ""): row for row in thread_defs}
 
     totals = {"blocked": 0, "in_progress": 0, "todo": 0, "done": 0}
@@ -732,6 +1274,7 @@ def read_board_snapshot(board_root: Path) -> dict[str, Any]:
                 thread_index.get(task.thread),
                 logs["latest"].get(task.thread),
                 branch_snapshots.get(task.thread),
+                runtime_index.get(task.thread),
             )
             for task in tasks
             if task.status == status
@@ -763,6 +1306,7 @@ def read_board_snapshot(board_root: Path) -> dict[str, Any]:
                         row,
                         logs["latest"].get(thread_id),
                         branch_snapshots.get(thread_id),
+                        runtime_index.get(thread_id),
                     )
                     if selected_task is not None
                     else None
@@ -771,6 +1315,7 @@ def read_board_snapshot(board_root: Path) -> dict[str, Any]:
                 "runtime_start": logs["kickoff_latest"].get(thread_id),
                 "last_invocation": logs["last_invocation"].get(thread_id),
                 "branches": branch_snapshots.get(thread_id),
+                "runtime": runtime_index.get(thread_id),
             }
         )
 
@@ -803,6 +1348,7 @@ def parse_rollout_delta(
     start_offset: int,
     start_line_number: int,
     pending_fragment: str,
+    start_tool_call_names: dict[str, str],
     initial_running: bool,
     reset: bool,
 ) -> ParsedFileDelta:
@@ -825,10 +1371,16 @@ def parse_rollout_delta(
     updated_at: str | None = None
     cwd: str | None = None
     source: str | None = None
+    source_kind: str | None = None
     originator: str | None = None
     model_provider: str | None = None
     cli_version: str | None = None
+    parent_thread_id: str | None = None
+    source_depth: int | None = None
+    agent_nickname: str | None = None
+    agent_role: str | None = None
     messages: list[ChatMessage] = []
+    tool_call_names = {} if reset else dict(start_tool_call_names)
 
     for piece in pieces:
         line_number += 1
@@ -852,6 +1404,24 @@ def parse_rollout_delta(
                     source = str(meta["source"])
                 if isinstance(meta.get("originator"), str):
                     originator = str(meta["originator"])
+                source_meta = parse_source_metadata(meta.get("source"))
+                if source_meta.raw_text:
+                    source = source_meta.raw_text
+                source_kind = source_meta.kind
+                parent_thread_id = (
+                    str(meta["forked_from_id"])
+                    if meta.get("forked_from_id")
+                    else source_meta.parent_thread_id
+                )
+                source_depth = source_meta.depth
+                if isinstance(meta.get("agent_nickname"), str):
+                    agent_nickname = str(meta["agent_nickname"])
+                elif source_meta.agent_nickname:
+                    agent_nickname = source_meta.agent_nickname
+                if isinstance(meta.get("agent_role"), str):
+                    agent_role = str(meta["agent_role"])
+                elif source_meta.agent_role:
+                    agent_role = source_meta.agent_role
                 if isinstance(meta.get("model_provider"), str):
                     model_provider = str(meta["model_provider"])
                 if isinstance(meta.get("cli_version"), str):
@@ -908,9 +1478,13 @@ def parse_rollout_delta(
                 )
             continue
 
-        if item_type == "function_call":
+        if item_type in {"function_call", "custom_tool_call"}:
             name = str(item.get("name") or "tool")
-            text = summarize_tool_call(name, item.get("arguments"))
+            call_id = str(item.get("call_id") or "")
+            if call_id:
+                tool_call_names[call_id] = name
+            arguments = item.get("input") if item_type == "custom_tool_call" else item.get("arguments")
+            text = summarize_tool_call(name, arguments)
             if text:
                 messages.append(
                     ChatMessage(
@@ -923,6 +1497,40 @@ def parse_rollout_delta(
                         tool_name=name,
                     )
                 )
+            continue
+
+        if item_type in {"function_call_output", "custom_tool_call_output"}:
+            call_id = str(item.get("call_id") or "")
+            name = tool_call_names.get(call_id, "tool")
+            text = summarize_tool_output(name, item.get("output"))
+            if text:
+                messages.append(
+                    ChatMessage(
+                        id=stable_message_id(thread_id, line_number),
+                        role="tool",
+                        text=text,
+                        created_at=str(timestamp or updated_at or utc_now()),
+                        state="done",
+                        kind="tool_call",
+                        tool_name=name,
+                    )
+                )
+            continue
+
+        if item_type == "web_search_call":
+            text = summarize_web_search_call(item)
+            if text:
+                messages.append(
+                    ChatMessage(
+                        id=stable_message_id(thread_id, line_number),
+                        role="tool",
+                        text=text,
+                        created_at=str(timestamp or updated_at or utc_now()),
+                        state="done",
+                        kind="tool_call",
+                        tool_name="web_search",
+                    )
+                )
 
     return ParsedFileDelta(
         messages=messages,
@@ -930,9 +1538,14 @@ def parse_rollout_delta(
         updated_at=updated_at,
         cwd=cwd,
         source=source,
+        source_kind=source_kind,
         originator=originator,
         model_provider=model_provider,
         cli_version=cli_version,
+        parent_thread_id=parent_thread_id,
+        source_depth=source_depth,
+        agent_nickname=agent_nickname,
+        agent_role=agent_role,
         running=running,
         next_offset=stat_result.st_size,
         next_line_number=line_number,
@@ -940,6 +1553,7 @@ def parse_rollout_delta(
         stat_size=stat_result.st_size,
         stat_mtime_ns=stat_result.st_mtime_ns,
         reset_applied=reset,
+        tool_call_names=tool_call_names,
     )
 
 
@@ -1020,6 +1634,32 @@ class SessionStore:
         if not self.threads_db_path.exists():
             return []
         return await asyncio.to_thread(read_recent_projects_from_sqlite, self.threads_db_path, self.scan_limit)
+
+    async def list_board_runtime_sessions(self, board_root: Path) -> list[dict[str, Any]]:
+        live_sessions = await self.list_sessions()
+        config = await asyncio.to_thread(read_board_config, board_root)
+        target_repo_root = str(config.get("target_repo")) if isinstance(config, dict) and config.get("target_repo") else None
+        worktree_root = str(config.get("worktree_root")) if isinstance(config, dict) and config.get("worktree_root") else None
+
+        merged: dict[str, dict[str, Any]] = {}
+        if self.threads_db_path.exists():
+            historical = await asyncio.to_thread(
+                read_board_runtime_sessions_from_sqlite,
+                self.threads_db_path,
+                max(self.scan_limit * 50, 3000),
+                self.allowed_sources,
+                str(board_root),
+                target_repo_root,
+                worktree_root,
+            )
+            merged.update({item["id"]: item for item in historical if isinstance(item.get("id"), str)})
+
+        for session in live_sessions:
+            session_id = session.get("id")
+            if isinstance(session_id, str):
+                merged[session_id] = session
+
+        return list(merged.values())
 
     async def list_board_folders(self) -> list[dict[str, Any]]:
         recent_project_paths: list[str] = []
@@ -1129,10 +1769,16 @@ class SessionStore:
                 updated_at=record.updated_at,
                 thread_id=record.thread_id,
                 imported=True,
-                desktop_thread=True,
+                desktop_thread=is_desktop_reply_source(record.source_kind),
                 data_source="codex-sqlite+rollout",
                 rollout_path=record.rollout_path,
-                bridge_reply_available=True,
+                source_kind=record.source_kind,
+                git_branch=record.git_branch,
+                parent_thread_id=record.parent_thread_id,
+                source_depth=record.source_depth,
+                agent_nickname=record.agent_nickname,
+                agent_role=record.agent_role,
+                bridge_reply_available=is_desktop_reply_source(record.source_kind),
             )
             self.sessions[record.thread_id] = session
 
@@ -1142,9 +1788,15 @@ class SessionStore:
                 session.updated_at,
                 session.cwd,
                 session.source,
+                session.source_kind,
+                session.git_branch,
                 session.rollout_path,
                 session.model_provider,
                 session.cli_version,
+                session.parent_thread_id,
+                session.source_depth,
+                session.agent_nickname,
+                session.agent_role,
             )
             session.title = record.title
             session.created_at = record.created_at
@@ -1153,12 +1805,19 @@ class SessionStore:
             session.cwd = record.cwd
             session.project_root, session.project_name = infer_project_identity(record.cwd)
             session.source = record.source
+            session.source_kind = record.source_kind
+            session.git_branch = record.git_branch
             session.imported = True
-            session.desktop_thread = True
+            session.desktop_thread = is_desktop_reply_source(record.source_kind)
             session.data_source = "codex-sqlite+rollout"
             session.rollout_path = record.rollout_path
             session.model_provider = record.model_provider
             session.cli_version = record.cli_version
+            session.parent_thread_id = record.parent_thread_id
+            session.source_depth = record.source_depth
+            session.agent_nickname = record.agent_nickname
+            session.agent_role = record.agent_role
+            session.bridge_reply_available = is_desktop_reply_source(record.source_kind)
             if not session.messages and record.first_user_message and session.title.startswith("Thread "):
                 session.title = record.first_user_message.splitlines()[0][:48]
             metadata_changed = previous_summary != (
@@ -1167,9 +1826,15 @@ class SessionStore:
                 session.updated_at,
                 session.cwd,
                 session.source,
+                session.source_kind,
+                session.git_branch,
                 session.rollout_path,
                 session.model_provider,
                 session.cli_version,
+                session.parent_thread_id,
+                session.source_depth,
+                session.agent_nickname,
+                session.agent_role,
             )
 
         rollout_path = Path(record.rollout_path).expanduser()
@@ -1195,6 +1860,7 @@ class SessionStore:
             session.last_read_offset,
             session.last_line_number,
             "" if should_reset else session.pending_fragment,
+            {} if should_reset else session.tool_call_names,
             session.running,
             should_reset or session.last_read_offset == 0,
         )
@@ -1218,12 +1884,22 @@ class SessionStore:
                 session.project_root, session.project_name = infer_project_identity(delta.cwd)
             if delta.source:
                 session.source = delta.source
+            if delta.source_kind:
+                session.source_kind = delta.source_kind
             if delta.originator:
                 session.originator = delta.originator
             if delta.model_provider:
                 session.model_provider = delta.model_provider
             if delta.cli_version:
                 session.cli_version = delta.cli_version
+            if delta.parent_thread_id:
+                session.parent_thread_id = delta.parent_thread_id
+            if delta.source_depth is not None:
+                session.source_depth = delta.source_depth
+            if delta.agent_nickname:
+                session.agent_nickname = delta.agent_nickname
+            if delta.agent_role:
+                session.agent_role = delta.agent_role
 
             new_messages: list[ChatMessage] = []
             for message in delta.messages:
@@ -1239,6 +1915,7 @@ class SessionStore:
             session.last_disk_size = delta.stat_size
             session.last_disk_mtime_ns = delta.stat_mtime_ns
             session.messages.sort(key=lambda item: item.created_at)
+            session.tool_call_names = dict(list(delta.tool_call_names.items())[-256:])
 
         for message in new_messages:
             await self.publish(session, role_event_type(message.role), {"message": asdict(message)})
@@ -1248,39 +1925,67 @@ class SessionStore:
             await self.publish(session, "session.synced", {"session": session.summary()})
 
 
-async def run_codex(session: ChatSession, store: SessionStore, prompt: str, cwd: Path, model: str | None) -> None:
+async def run_codex(
+    session: ChatSession,
+    store: SessionStore,
+    prompt: str,
+    cwd: Path,
+    model: str | None,
+    access_mode: str | None,
+    image_paths: list[Path],
+) -> None:
     session.running = True
     session.cwd = str(cwd)
     session.project_root, session.project_name = infer_project_identity(session.cwd)
-    await store.publish(session, "run.started", {"cwd": str(cwd), "model": model})
+    resolved_access_mode = normalize_access_mode(access_mode)
+    await store.publish(
+        session,
+        "run.started",
+        {
+            "cwd": str(cwd),
+            "model": model,
+            "access_mode": resolved_access_mode,
+            "image_count": len(image_paths),
+        },
+    )
     temp_file = Path(tempfile.mkstemp(prefix=f"{session.id}-", suffix=".txt")[1])
 
     try:
-        command = ["codex", "exec"]
-        if session.thread_id:
-            command.extend(["resume", session.thread_id])
-        command.extend(
-            [
-                "--json",
-                "--skip-git-repo-check",
-                "--sandbox",
-                "workspace-write",
-                "--output-last-message",
-                str(temp_file),
-            ]
-        )
+        command = [
+            "codex",
+            "exec",
+            "--json",
+            "--skip-git-repo-check",
+            "--output-last-message",
+            str(temp_file),
+        ]
         if model:
             command.extend(["--model", model])
-        command.append(prompt)
+        if resolved_access_mode == "danger-full-access":
+            command.append("--dangerously-bypass-approvals-and-sandbox")
+        else:
+            command.extend(["--sandbox", resolved_access_mode])
+        for image_path in image_paths:
+            command.extend(["--image", str(image_path)])
+        if session.thread_id:
+            command.extend(["resume", session.thread_id, "-"])
+        else:
+            command.append("-")
 
         await store.publish(session, "run.command", {"argv": command})
 
         process = await asyncio.create_subprocess_exec(
             *command,
             cwd=str(cwd),
+            stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )
+
+        if process.stdin is not None:
+            process.stdin.write(prompt.encode("utf-8"))
+            await process.stdin.drain()
+            process.stdin.close()
 
         assert process.stdout is not None
         async for raw_line in process.stdout:
@@ -1390,23 +2095,40 @@ async def handle_send_message(request: web.Request) -> web.Response:
     if session.running:
         return json_response({"error": "session is already running"}, status=409)
 
-    payload = await request.json()
-    if not isinstance(payload, dict):
-        return json_response({"error": "invalid json body"}, status=400)
+    payload: dict[str, Any]
+    attachment_fields: list[Any] = []
+    if request.content_type.startswith("multipart/form-data"):
+        form = await request.post()
+        payload = {key: form.get(key) for key in form.keys()}
+        for field_name in ("attachments", "attachment", "files", "file", "images", "image"):
+            for value in form.getall(field_name, []):
+                if hasattr(value, "file") and hasattr(value, "filename"):
+                    attachment_fields.append(value)
+    else:
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            return json_response({"error": "invalid json body"}, status=400)
 
     text = str(payload.get("text", "")).strip()
     model = str(payload.get("model")).strip() if payload.get("model") else None
+    access_mode = normalize_access_mode(str(payload.get("access_mode", "")).strip() or None)
     cwd_value = str(payload.get("cwd")).strip() if payload.get("cwd") else (session.cwd or str(store.workspace))
     cwd = Path(cwd_value).expanduser().resolve()
 
-    if not text:
-        return json_response({"error": "text is required"}, status=400)
+    if not text and not attachment_fields:
+        return json_response({"error": "text or attachments are required"}, status=400)
     if not cwd.exists():
         return json_response({"error": f"cwd not found: {cwd}"}, status=400)
     if session.imported and not session.desktop_thread:
         return json_response({"error": "reply is only enabled for desktop threads"}, status=400)
 
-    session.active_task = asyncio.create_task(run_codex(session, store, text, cwd, model))
+    attachments = save_mobile_uploads(attachment_fields, cwd, session.id) if attachment_fields else []
+    image_paths = [Path(item["path"]) for item in attachments if item["is_image"]]
+    prompt = build_mobile_prompt(text, attachments)
+
+    session.active_task = asyncio.create_task(
+        run_codex(session, store, prompt, cwd, model, access_mode, image_paths)
+    )
     return json_response({"accepted": True, "session": session.summary()}, status=202)
 
 
@@ -1472,9 +2194,16 @@ async def handle_list_boards(request: web.Request) -> web.Response:
     else:
         scan_folders = [Path(item["path"]) for item in await store.list_board_folders()]
     boards: list[dict[str, Any]] = []
+    seen_board_ids: set[str] = set()
     for scan_folder in scan_folders:
         for board_root in discover_boards_in_folder(scan_folder):
-            snapshot = read_board_snapshot(board_root)
+            snapshot = read_board_snapshot(
+                board_root,
+                session_summaries=await store.list_board_runtime_sessions(board_root),
+            )
+            if snapshot["id"] in seen_board_ids:
+                continue
+            seen_board_ids.add(snapshot["id"])
             boards.append(
                 {
                     "id": snapshot["id"],
@@ -1502,7 +2231,12 @@ async def handle_get_board(request: web.Request) -> web.Response:
     for folder in await store.list_board_folders():
         for board_root in discover_boards_in_folder(Path(folder["path"])):
             if board_id_for_path(board_root) == board_id:
-                return json_response(read_board_snapshot(board_root))
+                return json_response(
+                    read_board_snapshot(
+                        board_root,
+                        session_summaries=await store.list_board_runtime_sessions(board_root),
+                    )
+                )
     return json_response({"error": "board not found"}, status=404)
 
 
@@ -1524,7 +2258,7 @@ def create_app() -> web.Application:
     poll_interval = float(os.environ.get("CODEX_BRIDGE_POLL_SECONDS", "2"))
     allowed_sources = {
         item.strip()
-        for item in os.environ.get("CODEX_BRIDGE_ALLOWED_SOURCES", "vscode,app").split(",")
+        for item in os.environ.get("CODEX_BRIDGE_ALLOWED_SOURCES", DEFAULT_ALLOWED_SOURCE_KINDS).split(",")
         if item.strip()
     }
     board_roots = tuple(

@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import UniformTypeIdentifiers
 
 private enum BridgeURLParser {
     static func makeBaseURL(from raw: String) -> URL? {
@@ -11,6 +12,9 @@ private enum BridgeURLParser {
 
 @MainActor
 final class AppState: ObservableObject {
+    @Published var selectedModel = ComposerModelOption.automatic
+    @Published var selectedAccessMode = ComposerAccessMode.workspaceWrite
+    @Published var draftAttachments: [DraftAttachment] = []
     @Published var sessions: [SessionSummary] = []
     @Published var projects: [ProjectSummary] = []
     @Published var selectedSessionID: String?
@@ -26,12 +30,18 @@ final class AppState: ObservableObject {
     @Published var currentProjectRoot: String?
     @Published var currentProjectName: String?
     @Published var currentSource: String = "bridge"
+    @Published var currentSourceKind: String = "bridge"
     @Published var currentOriginator: String?
     @Published var isImportedSession = false
     @Published var currentDataSource: String = "bridge"
     @Published var currentRolloutPath: String?
+    @Published var currentGitBranch: String?
     @Published var currentModelProvider: String?
     @Published var currentCLIVersion: String?
+    @Published var currentParentThreadID: String?
+    @Published var currentSourceDepth: Int?
+    @Published var currentAgentNickname: String?
+    @Published var currentAgentRole: String?
     @Published var bridgeReplyAvailable = false
 
     private let bridge = BridgeClient()
@@ -42,6 +52,11 @@ final class AppState: ObservableObject {
     init() {
         if let raw = UserDefaults.standard.string(forKey: "bridge_url") {
             self.baseURL = BridgeURLParser.makeBaseURL(from: raw)
+        }
+        selectedModel = ComposerModelOption.from(raw: UserDefaults.standard.string(forKey: "composer_model"))
+        if let rawAccessMode = UserDefaults.standard.string(forKey: "composer_access_mode"),
+           let accessMode = ComposerAccessMode(rawValue: rawAccessMode) {
+            selectedAccessMode = accessMode
         }
     }
 
@@ -99,6 +114,8 @@ final class AppState: ObservableObject {
                 projectRoot: detail.projectRoot,
                 projectName: detail.projectName,
                 source: detail.source,
+                sourceKind: detail.sourceKind,
+                gitBranch: detail.gitBranch,
                 originator: detail.originator,
                 imported: detail.imported,
                 desktopThread: detail.desktopThread,
@@ -106,6 +123,10 @@ final class AppState: ObservableObject {
                 rolloutPath: detail.rolloutPath,
                 modelProvider: detail.modelProvider,
                 cliVersion: detail.cliVersion,
+                parentThreadID: detail.parentThreadID,
+                sourceDepth: detail.sourceDepth,
+                agentNickname: detail.agentNickname,
+                agentRole: detail.agentRole,
                 bridgeReplyAvailable: detail.bridgeReplyAvailable,
                 running: detail.running,
                 messageCount: detail.messageCount,
@@ -138,7 +159,7 @@ final class AppState: ObservableObject {
 
     func sendDraft() async {
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return }
+        guard !text.isEmpty || !draftAttachments.isEmpty else { return }
         guard let sessionID = selectedSessionID else {
             errorMessage = "先选择一个桌面线程"
             return
@@ -149,17 +170,92 @@ final class AppState: ObservableObject {
             return
         }
 
-        draft = ""
         isRunning = true
         statusText = "Running"
+        let attachments = draftAttachments
         do {
-            try await bridge.sendMessage(baseURL: baseURL, sessionID: sessionID, text: text)
+            try await bridge.sendMessage(
+                baseURL: baseURL,
+                sessionID: sessionID,
+                text: text,
+                model: selectedModel.rawValue.isEmpty ? nil : selectedModel.rawValue,
+                accessMode: selectedAccessMode.rawValue,
+                cwd: currentCWD,
+                attachments: attachments
+            )
+            draft = ""
+            clearDraftAttachments()
             errorMessage = nil
         } catch {
-            draft = text
             isRunning = false
             statusText = "Failed"
             errorMessage = error.localizedDescription
+        }
+    }
+
+    func updateSelectedModel(_ option: ComposerModelOption) {
+        selectedModel = option
+        UserDefaults.standard.set(option.rawValue, forKey: "composer_model")
+    }
+
+    func updateSelectedAccessMode(_ mode: ComposerAccessMode) {
+        selectedAccessMode = mode
+        UserDefaults.standard.set(mode.rawValue, forKey: "composer_access_mode")
+    }
+
+    func addAttachment(data: Data, suggestedName: String, contentType: String, isImage: Bool) throws {
+        let draftsDirectory = FileManager.default.temporaryDirectory.appendingPathComponent("CodeXMobileDrafts", isDirectory: true)
+        try FileManager.default.createDirectory(at: draftsDirectory, withIntermediateDirectories: true)
+
+        let sanitizedName = sanitizedAttachmentName(from: suggestedName, fallbackExtension: fallbackExtension(for: contentType, isImage: isImage))
+        let destination = draftsDirectory.appendingPathComponent("\(UUID().uuidString)-\(sanitizedName)")
+        try data.write(to: destination, options: .atomic)
+
+        let attachment = DraftAttachment(
+            id: UUID(),
+            fileURL: destination,
+            displayName: sanitizedName,
+            contentType: resolvedContentType(raw: contentType, filename: sanitizedName, isImage: isImage),
+            isImage: isImage,
+            byteCount: Int64(data.count)
+        )
+        draftAttachments.append(attachment)
+    }
+
+    func importAttachments(from urls: [URL]) throws {
+        for url in urls {
+            let hasAccess = url.startAccessingSecurityScopedResource()
+            defer {
+                if hasAccess {
+                    url.stopAccessingSecurityScopedResource()
+                }
+            }
+
+            let data = try Data(contentsOf: url)
+            let resourceValues = try? url.resourceValues(forKeys: [.contentTypeKey, .fileSizeKey])
+            let resourceType = resourceValues?.contentType
+            let contentType = resourceType?.preferredMIMEType ?? resolvedContentType(raw: "", filename: url.lastPathComponent, isImage: false)
+            let isImage = resourceType?.conforms(to: .image) ?? false
+            try addAttachment(
+                data: data,
+                suggestedName: url.lastPathComponent,
+                contentType: contentType,
+                isImage: isImage
+            )
+        }
+    }
+
+    func removeAttachment(id: UUID) {
+        guard let index = draftAttachments.firstIndex(where: { $0.id == id }) else { return }
+        let attachment = draftAttachments.remove(at: index)
+        try? FileManager.default.removeItem(at: attachment.fileURL)
+    }
+
+    func clearDraftAttachments() {
+        let attachments = draftAttachments
+        draftAttachments = []
+        for attachment in attachments {
+            try? FileManager.default.removeItem(at: attachment.fileURL)
         }
     }
 
@@ -170,12 +266,18 @@ final class AppState: ObservableObject {
         currentProjectRoot = detail.projectRoot
         currentProjectName = detail.projectName
         currentSource = detail.source
+        currentSourceKind = detail.sourceKind ?? detail.source
         currentOriginator = detail.originator
         isImportedSession = detail.imported
         currentDataSource = detail.dataSource
         currentRolloutPath = detail.rolloutPath
+        currentGitBranch = detail.gitBranch
         currentModelProvider = detail.modelProvider
         currentCLIVersion = detail.cliVersion
+        currentParentThreadID = detail.parentThreadID
+        currentSourceDepth = detail.sourceDepth
+        currentAgentNickname = detail.agentNickname
+        currentAgentRole = detail.agentRole
         bridgeReplyAvailable = detail.bridgeReplyAvailable
         messages = detail.messages
         isRunning = detail.running
@@ -258,6 +360,8 @@ final class AppState: ObservableObject {
             projectRoot: detail.projectRoot,
             projectName: detail.projectName,
             source: detail.source,
+            sourceKind: detail.sourceKind,
+            gitBranch: detail.gitBranch,
             originator: detail.originator,
             imported: detail.imported,
             desktopThread: detail.desktopThread,
@@ -265,6 +369,10 @@ final class AppState: ObservableObject {
             rolloutPath: detail.rolloutPath,
             modelProvider: detail.modelProvider,
             cliVersion: detail.cliVersion,
+            parentThreadID: detail.parentThreadID,
+            sourceDepth: detail.sourceDepth,
+            agentNickname: detail.agentNickname,
+            agentRole: detail.agentRole,
             bridgeReplyAvailable: detail.bridgeReplyAvailable,
             running: detail.running,
             messageCount: detail.messageCount,
@@ -278,6 +386,41 @@ final class AppState: ObservableObject {
         sessions.sort { $0.updatedAt > $1.updatedAt }
     }
 
+}
+
+private extension AppState {
+    func sanitizedAttachmentName(from name: String, fallbackExtension: String) -> String {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let source = trimmed.isEmpty ? "attachment\(fallbackExtension)" : trimmed
+        let pattern = #"[^A-Za-z0-9._-]+"#
+        let sanitized = source.replacingOccurrences(of: pattern, with: "-", options: .regularExpression)
+        let finalName = sanitized.trimmingCharacters(in: CharacterSet(charactersIn: "-."))
+        if finalName.isEmpty {
+            return "attachment\(fallbackExtension)"
+        }
+        if URL(fileURLWithPath: finalName).pathExtension.isEmpty, !fallbackExtension.isEmpty {
+            return finalName + fallbackExtension
+        }
+        return finalName
+    }
+
+    func fallbackExtension(for contentType: String, isImage: Bool) -> String {
+        if let type = UTType(mimeType: contentType), let preferred = type.preferredFilenameExtension {
+            return ".\(preferred)"
+        }
+        return isImage ? ".jpg" : ""
+    }
+
+    func resolvedContentType(raw: String, filename: String, isImage: Bool) -> String {
+        if !raw.isEmpty {
+            return raw
+        }
+        if let type = UTType(filenameExtension: URL(fileURLWithPath: filename).pathExtension),
+           let mimeType = type.preferredMIMEType {
+            return mimeType
+        }
+        return isImage ? "image/jpeg" : "application/octet-stream"
+    }
 }
 
 @MainActor

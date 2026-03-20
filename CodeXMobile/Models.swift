@@ -1,5 +1,76 @@
 import Foundation
 
+enum ComposerAccessMode: String, CaseIterable, Identifiable {
+    case readOnly = "read-only"
+    case workspaceWrite = "workspace-write"
+    case dangerFullAccess = "danger-full-access"
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .readOnly:
+            return "只读"
+        case .workspaceWrite:
+            return "工作区写入"
+        case .dangerFullAccess:
+            return "完全访问"
+        }
+    }
+
+    var subtitle: String {
+        switch self {
+        case .readOnly:
+            return "允许分析和回复，不允许修改文件"
+        case .workspaceWrite:
+            return "允许修改当前项目工作区"
+        case .dangerFullAccess:
+            return "允许不受沙箱限制地执行"
+        }
+    }
+}
+
+enum ComposerModelOption: String, CaseIterable, Identifiable {
+    case automatic = ""
+    case gpt54 = "gpt-5.4"
+    case gpt53Codex = "gpt-5.3-codex"
+    case gpt52 = "gpt-5.2"
+    case o3 = "o3"
+
+    var id: String { rawValue.isEmpty ? "automatic" : rawValue }
+
+    var title: String {
+        switch self {
+        case .automatic:
+            return "跟随桌面默认"
+        case .gpt54:
+            return "GPT-5.4"
+        case .gpt53Codex:
+            return "GPT-5.3-Codex"
+        case .gpt52:
+            return "GPT-5.2"
+        case .o3:
+            return "O3"
+        }
+    }
+
+    static func from(raw: String?) -> ComposerModelOption {
+        guard let raw, let matched = Self.allCases.first(where: { $0.rawValue == raw }) else {
+            return .automatic
+        }
+        return matched
+    }
+}
+
+struct DraftAttachment: Identifiable, Hashable {
+    let id: UUID
+    let fileURL: URL
+    let displayName: String
+    let contentType: String
+    let isImage: Bool
+    let byteCount: Int64
+}
+
 struct SessionListResponse: Decodable {
     let sessions: [SessionSummary]
 }
@@ -32,6 +103,8 @@ struct SessionSummary: Decodable, Identifiable, Hashable {
     let projectRoot: String?
     let projectName: String?
     let source: String
+    let sourceKind: String?
+    let gitBranch: String?
     let originator: String?
     let imported: Bool
     let desktopThread: Bool
@@ -39,6 +112,10 @@ struct SessionSummary: Decodable, Identifiable, Hashable {
     let rolloutPath: String?
     let modelProvider: String?
     let cliVersion: String?
+    let parentThreadID: String?
+    let sourceDepth: Int?
+    let agentNickname: String?
+    let agentRole: String?
     let bridgeReplyAvailable: Bool
     let running: Bool
     let messageCount: Int
@@ -54,6 +131,8 @@ struct SessionSummary: Decodable, Identifiable, Hashable {
         case projectRoot = "project_root"
         case projectName = "project_name"
         case source
+        case sourceKind = "source_kind"
+        case gitBranch = "git_branch"
         case originator
         case imported
         case desktopThread = "desktop_thread"
@@ -61,6 +140,10 @@ struct SessionSummary: Decodable, Identifiable, Hashable {
         case rolloutPath = "rollout_path"
         case modelProvider = "model_provider"
         case cliVersion = "cli_version"
+        case parentThreadID = "parent_thread_id"
+        case sourceDepth = "source_depth"
+        case agentNickname = "agent_nickname"
+        case agentRole = "agent_role"
         case bridgeReplyAvailable = "bridge_reply_available"
         case running
         case messageCount = "message_count"
@@ -78,6 +161,8 @@ struct SessionDetail: Decodable {
     let projectRoot: String?
     let projectName: String?
     let source: String
+    let sourceKind: String?
+    let gitBranch: String?
     let originator: String?
     let imported: Bool
     let desktopThread: Bool
@@ -85,6 +170,10 @@ struct SessionDetail: Decodable {
     let rolloutPath: String?
     let modelProvider: String?
     let cliVersion: String?
+    let parentThreadID: String?
+    let sourceDepth: Int?
+    let agentNickname: String?
+    let agentRole: String?
     let bridgeReplyAvailable: Bool
     let running: Bool
     let messageCount: Int
@@ -102,6 +191,8 @@ struct SessionDetail: Decodable {
         case projectRoot = "project_root"
         case projectName = "project_name"
         case source
+        case sourceKind = "source_kind"
+        case gitBranch = "git_branch"
         case originator
         case imported
         case desktopThread = "desktop_thread"
@@ -109,6 +200,10 @@ struct SessionDetail: Decodable {
         case rolloutPath = "rollout_path"
         case modelProvider = "model_provider"
         case cliVersion = "cli_version"
+        case parentThreadID = "parent_thread_id"
+        case sourceDepth = "source_depth"
+        case agentNickname = "agent_nickname"
+        case agentRole = "agent_role"
         case bridgeReplyAvailable = "bridge_reply_available"
         case running
         case messageCount = "message_count"
@@ -287,6 +382,7 @@ struct BoardTask: Decodable, Identifiable, Hashable {
     let autoBranch: Bool
     let latestLog: BoardLogEntry?
     let branches: BoardBranches?
+    let runtime: BoardRuntimeSnapshot?
 
     private enum CodingKeys: String, CodingKey {
         case id
@@ -303,6 +399,7 @@ struct BoardTask: Decodable, Identifiable, Hashable {
         case autoBranch = "auto_branch"
         case latestLog = "latest_log"
         case branches
+        case runtime
     }
 }
 
@@ -317,6 +414,7 @@ struct BoardThread: Decodable, Identifiable, Hashable {
     let runtimeStart: BoardRuntimeStart?
     let lastInvocation: BoardInvocation?
     let branches: BoardBranches?
+    let runtime: BoardRuntimeSnapshot?
 
     var id: String { thread }
 
@@ -331,6 +429,33 @@ struct BoardThread: Decodable, Identifiable, Hashable {
         case runtimeStart = "runtime_start"
         case lastInvocation = "last_invocation"
         case branches
+        case runtime
+    }
+}
+
+struct BoardRuntimeSnapshot: Decodable, Hashable {
+    let sessionCount: Int
+    let subagentCount: Int
+    let running: Bool
+    let updatedAt: Date?
+    let gitBranch: String?
+    let latestTitle: String?
+    let lastMessagePreview: String?
+    let sourceKind: String?
+    let agentNickname: String?
+    let agentRole: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case sessionCount = "session_count"
+        case subagentCount = "subagent_count"
+        case running
+        case updatedAt = "updated_at"
+        case gitBranch = "git_branch"
+        case latestTitle = "latest_title"
+        case lastMessagePreview = "last_message_preview"
+        case sourceKind = "source_kind"
+        case agentNickname = "agent_nickname"
+        case agentRole = "agent_role"
     }
 }
 
