@@ -325,6 +325,26 @@ def normalize_access_mode(value: str | None) -> str:
     return "workspace-write"
 
 
+def open_codex_desktop_thread(thread_id: str, cwd: str | None = None) -> None:
+    cleaned_thread_id = thread_id.strip()
+    if not cleaned_thread_id:
+        raise ValueError("missing thread id")
+
+    command = ["/usr/bin/open", "-a", "Codex", "--args", "resume", cleaned_thread_id]
+    if cwd:
+        command.extend(["-C", str(Path(cwd).expanduser().resolve())])
+
+    completed = subprocess.run(
+        command,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        message = (completed.stderr or completed.stdout or "open failed").strip()
+        raise RuntimeError(message)
+
+
 def resolve_codex_command() -> tuple[str, ...]:
     explicit_command = os.environ.get("CODEX_BRIDGE_CODEX_COMMAND", "").strip()
     explicit_bin = os.environ.get("CODEX_BRIDGE_CODEX_BIN", "").strip()
@@ -1310,6 +1330,8 @@ def build_board_runtime_index(
         representative = max(selected_group, key=representative_session_priority)
         controller = session_index.get(str(representative.get("parent_thread_id") or ""))
         runtime[thread_id] = {
+            "session_id": representative.get("id"),
+            "thread_id": representative.get("thread_id") or representative.get("id"),
             "session_count": len(selected_group),
             "subagent_count": sum(1 for item in selected_group if item.get("source_kind") == "subagent"),
             "running": any(bool(item.get("running")) for item in selected_group),
@@ -1326,6 +1348,7 @@ def build_board_runtime_index(
                 if isinstance(controller, dict)
                 else None
             ),
+            "open_available": bool(representative.get("thread_id") or representative.get("id")),
             "controller_running": (
                 bool(controller.get("running"))
                 if isinstance(controller, dict)
@@ -2323,6 +2346,7 @@ async def handle_root(request: web.Request) -> web.Response:
                 "/api/sessions",
                 "/api/board-folders",
                 "/api/sessions/{id}",
+                "/api/sessions/{id}/open",
                 "/api/sessions/{id}/messages",
                 "/api/sessions/{id}/events",
                 "/api/boards",
@@ -2388,6 +2412,31 @@ async def handle_send_message(request: web.Request) -> web.Response:
         run_codex(session, store, prompt, cwd, model, access_mode, image_paths)
     )
     return json_response({"accepted": True, "session": session.summary()}, status=202)
+
+
+async def handle_open_session(request: web.Request) -> web.Response:
+    store: SessionStore = request.app["store"]
+    session = await store.get_session(request.match_info["session_id"])
+    if session is None:
+        return json_response({"error": "session not found"}, status=404)
+
+    target_thread_id = str(session.thread_id or session.id or "").strip()
+    if not target_thread_id:
+        return json_response({"error": "session has no openable Codex thread id"}, status=400)
+
+    try:
+        await asyncio.to_thread(open_codex_desktop_thread, target_thread_id, session.cwd)
+    except Exception as exc:
+        return json_response({"error": f"failed to open Codex Desktop thread: {exc}"}, status=500)
+
+    return json_response(
+        {
+            "accepted": True,
+            "session_id": session.id,
+            "thread_id": target_thread_id,
+        },
+        status=202,
+    )
 
 
 async def handle_events(request: web.Request) -> web.StreamResponse:
@@ -2554,6 +2603,7 @@ def create_app() -> web.Application:
     app.router.add_get("/api/sessions", handle_list_sessions)
     app.router.add_get("/api/board-folders", handle_list_board_folders)
     app.router.add_get("/api/sessions/{session_id}", handle_get_session)
+    app.router.add_post("/api/sessions/{session_id}/open", handle_open_session)
     app.router.add_post("/api/sessions/{session_id}/messages", handle_send_message)
     app.router.add_get("/api/sessions/{session_id}/events", handle_events)
     app.router.add_get("/api/boards", handle_list_boards)

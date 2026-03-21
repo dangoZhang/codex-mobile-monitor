@@ -16,6 +16,7 @@ from bridge.bridge_server import (
     build_board_runtime_index,
     create_app,
     extract_runtime_thread_id,
+    open_codex_desktop_thread,
     parse_rollout_delta,
     read_board_snapshot,
     read_board_runtime_sessions_from_sqlite,
@@ -265,7 +266,22 @@ class BridgeServerTests(unittest.TestCase):
         self.assertNotIn(("GET", "/api/projects"), routes)
         self.assertNotIn(("POST", "/api/sessions"), routes)
         self.assertIn(("GET", "/api/sessions"), routes)
+        self.assertIn(("POST", "/api/sessions/{session_id}/open"), routes)
         self.assertIn(("POST", "/api/sessions/{session_id}/messages"), routes)
+
+    def test_open_codex_desktop_thread_launches_resume_in_codex_app(self) -> None:
+        with patch("bridge.bridge_server.subprocess.run") as mock_run:
+            mock_run.return_value.returncode = 0
+            mock_run.return_value.stdout = ""
+            mock_run.return_value.stderr = ""
+
+            open_codex_desktop_thread("thread-123", "/tmp/project")
+
+        mock_run.assert_called_once()
+        command = mock_run.call_args.args[0]
+        self.assertEqual(command[:5], ["/usr/bin/open", "-a", "Codex", "--args", "resume"])
+        self.assertEqual(command[5], "thread-123")
+        self.assertEqual(command[-2:], ["-C", str(Path("/tmp/project").resolve())])
 
     def test_read_board_runtime_sessions_from_sqlite_covers_board_parent_and_worktrees(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -704,6 +720,9 @@ class BridgeServerTests(unittest.TestCase):
             )
 
             self.assertEqual(runtime["thread1"]["latest_title"], "Godel (worker)")
+            self.assertEqual(runtime["thread1"]["session_id"], "thread1-worker-live")
+            self.assertEqual(runtime["thread1"]["thread_id"], "thread1-worker-live")
+            self.assertTrue(runtime["thread1"]["open_available"])
             self.assertEqual(runtime["thread1"]["controller_title"], "Desktop coordination thread")
             self.assertEqual(runtime["thread1"]["controller_source_kind"], "vscode")
             self.assertTrue(runtime["thread1"]["controller_running"])

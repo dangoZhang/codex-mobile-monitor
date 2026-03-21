@@ -703,7 +703,12 @@ private struct BoardsWorkspaceDetailView: View {
                             BoardHeroView(board: board)
                             BoardRepoStripView(board: board)
                             BoardColumnsView(columns: board.columns)
-                            BoardThreadsSectionView(threads: board.threads)
+                            BoardThreadsSectionView(
+                                threads: board.threads,
+                                onOpenSession: { sessionID in
+                                    Task { await state.openSessionInDesktop(sessionID: sessionID) }
+                                }
+                            )
                         } else if state.isLoading {
                             ProgressView()
                                 .tint(CodexPalette.accent)
@@ -1510,7 +1515,12 @@ private struct BoardPageView: View {
                         BoardHeroView(board: board)
                         BoardRepoStripView(board: board)
                         BoardColumnsView(columns: board.columns)
-                        BoardThreadsSectionView(threads: board.threads)
+                        BoardThreadsSectionView(
+                            threads: board.threads,
+                            onOpenSession: { sessionID in
+                                Task { await state.openSessionInDesktop(sessionID: sessionID) }
+                            }
+                        )
                     }
                     .padding(.horizontal, 28)
                     .padding(.vertical, 24)
@@ -1915,8 +1925,8 @@ private struct BoardTaskCardView: View {
             if let runtime = task.runtime {
                 HStack(spacing: 8) {
                     DetailBadge(
-                        text: runtime.running ? "Live" : (runtime.stale ? "Stale" : "Recent"),
-                        style: runtime.running ? .connected : (runtime.stale ? .warning : .neutral)
+                        text: boardRuntimeStatusText(runtime),
+                        style: boardRuntimeStatusStyle(runtime)
                     )
                     if runtime.subagentCount > 0 {
                         DetailBadge(text: "\(runtime.subagentCount) SubAgents", style: .warning)
@@ -1951,6 +1961,7 @@ private struct BoardTaskCardView: View {
 
 private struct BoardThreadsSectionView: View {
     let threads: [BoardThread]
+    let onOpenSession: (String) -> Void
 
     private let columns = [GridItem(.adaptive(minimum: 280), spacing: 16)]
 
@@ -1962,7 +1973,7 @@ private struct BoardThreadsSectionView: View {
 
             LazyVGrid(columns: columns, alignment: .leading, spacing: 16) {
                 ForEach(threads) { thread in
-                    BoardThreadCardView(thread: thread)
+                    BoardThreadCardView(thread: thread, onOpenSession: onOpenSession)
                 }
             }
         }
@@ -1971,6 +1982,7 @@ private struct BoardThreadsSectionView: View {
 
 private struct BoardThreadCardView: View {
     let thread: BoardThread
+    let onOpenSession: (String) -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -1986,8 +1998,8 @@ private struct BoardThreadCardView: View {
                 Spacer()
                 if let runtime = thread.runtime {
                     DetailBadge(
-                        text: runtime.running ? "Live" : (runtime.stale ? "Stale" : "Recent"),
-                        style: runtime.running ? .connected : (runtime.stale ? .warning : .neutral)
+                        text: boardRuntimeStatusText(runtime),
+                        style: boardRuntimeStatusStyle(runtime)
                     )
                 }
                 if let task = thread.task {
@@ -2053,6 +2065,18 @@ private struct BoardThreadCardView: View {
                         .lineLimit(1)
                 }
             }
+
+            if let sessionID = thread.runtime?.sessionID,
+               thread.runtime?.openAvailable ?? false {
+                Button {
+                    onOpenSession(sessionID)
+                } label: {
+                    Label("对话", systemImage: "message")
+                        .font(.system(size: 13, weight: .semibold))
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(CodexSecondaryButtonStyle())
+            }
         }
         .padding(16)
         .background(CodexPalette.panel, in: RoundedRectangle(cornerRadius: 20))
@@ -2093,6 +2117,26 @@ private func boardRuntimeContext(_ runtime: BoardRuntimeSnapshot) -> String? {
         return runtime.controllerRunning == true ? "Desktop thread live" : "Desktop thread"
     }
     return nil
+}
+
+private func boardRuntimeStatusText(_ runtime: BoardRuntimeSnapshot) -> String {
+    if runtime.running {
+        return "Live"
+    }
+    if runtime.stale {
+        return "Stale"
+    }
+    return "Stopped"
+}
+
+private func boardRuntimeStatusStyle(_ runtime: BoardRuntimeSnapshot) -> DetailBadge.Style {
+    if runtime.running {
+        return .connected
+    }
+    if runtime.stale {
+        return .warning
+    }
+    return .neutral
 }
 
 private struct BoardMiniStat: View {

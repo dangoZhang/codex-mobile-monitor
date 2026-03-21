@@ -127,6 +127,13 @@ final class BridgeClient {
         try validate(response: response, data: data)
     }
 
+    func openSessionInDesktop(baseURL: URL, sessionID: String) async throws {
+        var request = URLRequest(url: baseURL.bridgeEndpoint("api/sessions/\(sessionID)/open"))
+        request.httpMethod = "POST"
+        let (data, response) = try await session.data(for: request)
+        try validate(response: response, data: data)
+    }
+
     func streamEvents(
         baseURL: URL,
         sessionID: String,

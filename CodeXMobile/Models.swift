@@ -416,6 +416,8 @@ struct BoardThread: Decodable, Identifiable, Hashable {
 }
 
 struct BoardRuntimeSnapshot: Decodable, Hashable {
+    let sessionID: String?
+    let threadID: String?
     let sessionCount: Int
     let subagentCount: Int
     let running: Bool
@@ -431,8 +433,11 @@ struct BoardRuntimeSnapshot: Decodable, Hashable {
     let controllerTitle: String?
     let controllerSourceKind: String?
     let controllerRunning: Bool?
+    let openAvailable: Bool?
 
     private enum CodingKeys: String, CodingKey {
+        case sessionID = "session_id"
+        case threadID = "thread_id"
         case sessionCount = "session_count"
         case subagentCount = "subagent_count"
         case running
@@ -448,6 +453,7 @@ struct BoardRuntimeSnapshot: Decodable, Hashable {
         case controllerTitle = "controller_title"
         case controllerSourceKind = "controller_source_kind"
         case controllerRunning = "controller_running"
+        case openAvailable = "open_available"
     }
 }
 

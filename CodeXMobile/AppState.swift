@@ -498,6 +498,20 @@ final class BoardState: ObservableObject {
         }
     }
 
+    func openSessionInDesktop(sessionID: String) async {
+        guard let baseURL else {
+            errorMessage = "先填写 Mac Bridge 地址"
+            return
+        }
+
+        do {
+            try await bridge.openSessionInDesktop(baseURL: baseURL, sessionID: sessionID)
+            errorMessage = nil
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
     private func restartAutoRefreshLoop() {
         refreshTask?.cancel()
         guard baseURL != nil else { return }
