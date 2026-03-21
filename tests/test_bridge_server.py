@@ -13,8 +13,10 @@ from bridge.bridge_server import (
     SessionStore,
     annotate_runtime_snapshot,
     build_board_runtime_index,
+    create_app,
     extract_runtime_thread_id,
     parse_rollout_delta,
+    read_board_snapshot,
     read_board_runtime_sessions_from_sqlite,
     read_threads_from_sqlite,
     resolve_codex_command,
@@ -237,6 +239,32 @@ class BridgeServerTests(unittest.TestCase):
                 "legacy_mode",
             ),
         )
+
+    def test_create_app_exposes_only_real_session_routes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            with patch.dict(
+                "os.environ",
+                {
+                    "CODEX_BRIDGE_CWD": str(tmp_path),
+                    "CODEX_HOME": str(tmp_path / ".codex"),
+                    "CODEX_BRIDGE_THREADS_DB": str(tmp_path / "state.sqlite"),
+                    "CODEX_BRIDGE_BOARD_ROOTS": "",
+                    "CODEX_BRIDGE_BOARD_FOLDERS": "",
+                },
+                clear=False,
+            ), patch("bridge.bridge_server.resolve_codex_command", return_value=("codex",)), patch(
+                "bridge.bridge_server.probe_codex_version",
+                return_value="codex-cli test",
+            ):
+                app = create_app()
+
+        routes = {(route.method, route.resource.canonical) for route in app.router.routes()}
+
+        self.assertNotIn(("GET", "/api/projects"), routes)
+        self.assertNotIn(("POST", "/api/sessions"), routes)
+        self.assertIn(("GET", "/api/sessions"), routes)
+        self.assertIn(("POST", "/api/sessions/{session_id}/messages"), routes)
 
     def test_read_board_runtime_sessions_from_sqlite_covers_board_parent_and_worktrees(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -492,6 +520,80 @@ class BridgeServerTests(unittest.TestCase):
 
             self.assertEqual([item["id"] for item in sessions], ["alias-thread"])
 
+    def test_read_board_runtime_sessions_from_sqlite_includes_coordination_parent_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            board_root = root / "codex_coordination"
+            target_repo = root / "demo"
+            board_root.mkdir()
+            target_repo.mkdir()
+
+            db_path = root / "state.sqlite"
+            connection = sqlite3.connect(db_path)
+            self._create_threads_table(connection)
+            connection.execute(
+                """
+                INSERT INTO threads (
+                    id, rollout_path, created_at, updated_at, source, model_provider, cwd, title,
+                    sandbox_policy, approval_mode, tokens_used, has_user_event, archived,
+                    archived_at, git_sha, git_branch, git_origin_url, cli_version,
+                    first_user_message, agent_nickname, agent_role, memory_mode, model, reasoning_effort
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "thread1-root",
+                    "/tmp/root.jsonl",
+                    1774054800,
+                    1774054801,
+                    json.dumps(
+                        {
+                            "subagent": {
+                                "thread_spawn": {
+                                    "parent_thread_id": "parent-thread",
+                                    "depth": 1,
+                                    "agent_nickname": "Franklin",
+                                    "agent_role": "worker",
+                                }
+                            }
+                        },
+                        ensure_ascii=False,
+                    ),
+                    "openai_http",
+                    str(root),
+                    "You are acting as thread1 / 01-Backbone",
+                    "workspace-write",
+                    "never",
+                    0,
+                    1,
+                    0,
+                    None,
+                    None,
+                    None,
+                    None,
+                    "0.200.0",
+                    "You are acting as thread1 / 01-Backbone in the coordination workspace.",
+                    "Franklin",
+                    "worker",
+                    "enabled",
+                    "gpt-5.4",
+                    "medium",
+                ),
+            )
+            connection.commit()
+            connection.close()
+
+            sessions = read_board_runtime_sessions_from_sqlite(
+                db_path,
+                limit=20,
+                allowed_sources={"subagent"},
+                board_root=str(board_root),
+                target_repo_root=str(target_repo),
+            )
+
+            self.assertEqual([item["id"] for item in sessions], ["thread1-root"])
+            self.assertEqual(sessions[0]["source_kind"], "subagent")
+            self.assertIn("thread1", sessions[0]["first_user_message"])
+
     def test_build_board_runtime_index_prefers_thread_identity_before_branch(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
@@ -531,8 +633,8 @@ class BridgeServerTests(unittest.TestCase):
                 },
                 {
                     "id": "thread4-live",
-                    "title": "Benchmark worker",
-                    "first_user_message": "Benchmark case generated by thread4 for a missing capability.",
+                    "title": "You are acting as thread4 / 04-Test",
+                    "first_user_message": "You are acting as thread4 / 04-Test for the benchmark rerun.",
                     "cwd": str(root / ".codex-worktrees"),
                     "git_branch": None,
                     "updated_at": "2026-03-21T01:02:00.000Z",
@@ -563,9 +665,218 @@ class BridgeServerTests(unittest.TestCase):
 
             self.assertEqual(runtime["thread1"]["latest_title"], "Backend coding")
             self.assertEqual(runtime["thread3"]["latest_title"], "You are acting as 03-Review for this repository.")
-            self.assertEqual(runtime["thread4"]["latest_title"], "Benchmark worker")
+            self.assertEqual(runtime["thread4"]["latest_title"], "You are acting as thread4 / 04-Test")
             self.assertEqual(runtime["thread6"]["latest_title"], "You are thread6.")
             self.assertTrue(runtime["thread1"]["running"])
+
+    def test_build_board_runtime_index_ignores_cross_thread_mentions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            board_root = root / "codex_coordination"
+            target_repo = root / "demo"
+            board_root.mkdir()
+            target_repo.mkdir()
+
+            thread_defs = [
+                {"id": "thread1", "slot": "01", "name": "01-Backbone", "role": "Backend"},
+                {"id": "thread3", "slot": "03", "name": "03-Review", "role": "Review Gate"},
+                {"id": "thread4", "slot": "04", "name": "04-Test", "role": "Test / Experiment"},
+            ]
+            sessions = [
+                {
+                    "id": "review-worker",
+                    "title": "Hilbert (worker)",
+                    "first_user_message": (
+                        "You are acting as thread3 / 03-Review in the coordination workspace. "
+                        "Context: thread4 reported a blocker for thread1."
+                    ),
+                    "cwd": str(root),
+                    "git_branch": None,
+                    "updated_at": "2026-03-21T02:00:00.000Z",
+                    "source_kind": "subagent",
+                    "running": False,
+                    "last_message_preview": "reviewing",
+                },
+                {
+                    "id": "bench-exec",
+                    "title": "Generic benchmark prompt",
+                    "first_user_message": "Benchmark case generated by thread4 for a missing capability.",
+                    "cwd": str(root / ".codex-worktrees"),
+                    "git_branch": None,
+                    "updated_at": "2026-03-21T01:00:00.000Z",
+                    "source_kind": "exec",
+                    "running": False,
+                    "last_message_preview": "benchmark",
+                },
+            ]
+
+            runtime = build_board_runtime_index(
+                board_root,
+                str(target_repo),
+                None,
+                thread_defs,
+                sessions,
+            )
+
+            self.assertEqual(set(runtime.keys()), {"thread3"})
+            self.assertEqual(runtime["thread3"]["latest_title"], "Hilbert (worker)")
+
+    def test_list_board_runtime_sessions_filters_live_sessions_outside_board_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            board_root = root / "codex_coordination"
+            target_repo = root / "demo"
+            board_root.mkdir()
+            target_repo.mkdir()
+            (board_root / "coordination.config.json").write_text(
+                json.dumps({"target_repo": str(target_repo)}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            db_path = root / "state.sqlite"
+            connection = sqlite3.connect(db_path)
+            self._create_threads_table(connection)
+            connection.execute(
+                """
+                INSERT INTO threads (
+                    id, rollout_path, created_at, updated_at, source, model_provider, cwd, title,
+                    sandbox_policy, approval_mode, tokens_used, has_user_event, archived,
+                    archived_at, git_sha, git_branch, git_origin_url, cli_version,
+                    first_user_message, agent_nickname, agent_role, memory_mode, model, reasoning_effort
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "thread1-root",
+                    "/tmp/root.jsonl",
+                    1774054800,
+                    1774054802,
+                    "vscode",
+                    "openai_http",
+                    str(root),
+                    "You are acting as thread1 / 01-Backbone",
+                    "workspace-write",
+                    "never",
+                    0,
+                    1,
+                    0,
+                    None,
+                    None,
+                    "codex/thread1-mainline",
+                    None,
+                    "0.200.0",
+                    "You are acting as thread1 / 01-Backbone in the coordination workspace.",
+                    None,
+                    None,
+                    "enabled",
+                    "gpt-5.4",
+                    "medium",
+                ),
+            )
+            connection.commit()
+            connection.close()
+
+            store = SessionStore(
+                workspace=root,
+                codex_home=root,
+                codex_command=("codex",),
+                codex_version="codex-cli test",
+                threads_db_path=db_path,
+                scan_limit=60,
+                poll_interval=1.0,
+                allowed_sources={"vscode"},
+                board_folders=(root,),
+                board_roots=(board_root,),
+            )
+            store.sessions["thread1-root"] = ChatSession(
+                id="thread1-root",
+                title="You are acting as thread1 / 01-Backbone",
+                created_at="2026-03-21T01:00:00.000Z",
+                updated_at="2026-03-21T01:02:00.000Z",
+                thread_id="thread1-root",
+                cwd=str(root),
+                source="vscode",
+                source_kind="vscode",
+                git_branch="codex/thread1-mainline",
+                imported=True,
+                desktop_thread=True,
+                data_source="codex-sqlite+rollout",
+                first_user_message="You are acting as thread1 / 01-Backbone in the coordination workspace.",
+                bridge_reply_available=True,
+            )
+            store.sessions["outside-live"] = ChatSession(
+                id="outside-live",
+                title="Unrelated project",
+                created_at="2026-03-21T01:00:00.000Z",
+                updated_at="2026-03-21T01:03:00.000Z",
+                thread_id="outside-live",
+                cwd=str(root.parent / "elsewhere"),
+                source="vscode",
+                source_kind="vscode",
+                imported=True,
+                desktop_thread=True,
+                data_source="codex-sqlite+rollout",
+                first_user_message="This thread belongs to another project.",
+                bridge_reply_available=True,
+            )
+
+            sessions = asyncio.run(store.list_board_runtime_sessions(board_root))
+
+            self.assertEqual([item["id"] for item in sessions], ["thread1-root"])
+
+    def test_read_board_snapshot_only_marks_runtime_on_selected_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            board_root = root / "codex_coordination"
+            board_root.mkdir()
+            (board_root / "THREADS.json").write_text(
+                json.dumps(
+                    [{"id": "thread1", "slot": "01", "name": "01-Backbone", "role": "Backend"}],
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            (board_root / "TASK_BOARD.md").write_text(
+                "\n".join(
+                    [
+                        "# Task Board",
+                        "",
+                        "| ID | Thread | Task | Owner | Status | Depends On | Output |",
+                        "|---|---|---|---|---|---|---|",
+                        "| T1-OLD | thread1 | Old task | thread1 | DONE | - | old |",
+                        "| T1-CUR | thread1 | Current task | thread1 | IN_PROGRESS | - | current |",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            (board_root / "COMM_LOG.md").write_text(
+                "[2026-03-21 10:00] [thread1] [type: kickoff] Started current task.\n",
+                encoding="utf-8",
+            )
+
+            snapshot = read_board_snapshot(
+                board_root,
+                session_summaries=[
+                    {
+                        "id": "thread1-live",
+                        "title": "You are acting as thread1 / 01-Backbone",
+                        "first_user_message": "You are acting as thread1 / 01-Backbone in the coordination workspace.",
+                        "cwd": str(root),
+                        "git_branch": "codex/thread1-mainline",
+                        "updated_at": "2026-03-21T02:00:00.000Z",
+                        "source_kind": "vscode",
+                        "running": True,
+                        "last_message_preview": "editing backend",
+                    }
+                ],
+            )
+
+            done_task = next(task for column in snapshot["columns"] if column["status"] == "DONE" for task in column["tasks"])
+            current_task = next(
+                task for column in snapshot["columns"] if column["status"] == "IN_PROGRESS" for task in column["tasks"]
+            )
+            self.assertIsNone(done_task["runtime"])
+            self.assertIsNotNone(current_task["runtime"])
+            self.assertTrue(current_task["runtime"]["running"])
 
     def test_annotate_runtime_snapshot_marks_stale_when_board_log_is_newer(self) -> None:
         runtime = {

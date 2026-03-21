@@ -17,11 +17,17 @@ Codex Mobile Monitor 是一个 iPhone / iPad 客户端，用来监督 Mac 上真
 - Uses separate iPhone and iPad layouts: compact on iPhone, full sidebar on iPad
 - Groups threads by project folder and keeps a dedicated Boards page
 - Can resume the same desktop thread when mobile reply is allowed
+- Lets you choose the model per reply from iPhone/iPad
+- Lets you choose read-only, workspace-write, or full-access execution mode
+- Uploads files and images from iPhone/iPad into the real desktop workspace before resuming the thread
 - 从 Codex 本地状态读取真实桌面线程，而不是抓取终端文本
 - 流式展示用户消息、助手消息、commentary 与工具执行
 - iPhone 使用瘦身布局，iPad 使用完整侧栏布局
 - 按项目文件夹分组线程，并保留独立看板页面
 - 在允许回写时，可以继续同一个桌面线程
+- 可在手机端按次切换模型
+- 可切换只读、工作区写入、完全访问三种执行权限
+- 支持从 iPhone / iPad 上传文件和图片，并写入桌面线程所在工作区
 
 ## How It Works / 工作原理
 
@@ -250,9 +256,9 @@ http://YOUR-MAC-NAME.tailnet-name.ts.net:8765
 
 适合不在同一局域网时远程监督 Mac 上的 Codex 工作。
 
-### Option C: OpenClaw or your own tunnel / OpenClaw 或自有隧道
+### Option C: Your own secure tunnel / 自有安全隧道
 
-If you already run OpenClaw or another secure reverse proxy in your workflow, you can expose the bridge through that channel instead of raw LAN.
+The repository does not ship a built-in tunnel integration. If you already run your own secure reverse proxy or private tunnel, you can expose the bridge through that channel instead of raw LAN.
 
 Recommended constraints:
 
@@ -260,13 +266,51 @@ Recommended constraints:
 - do not expose it directly to the public internet without access control
 - prefer a tunnel that only your own devices can reach
 
-如果你已经在用 OpenClaw 或自建安全隧道，也可以把 bridge 通过那个通道暴露出来，而不是直接公网开放。
+本仓库不内置任何隧道集成。如果你已经在用自建安全隧道，也可以把 bridge 通过那个通道暴露出来，而不是直接公网开放。
 
 建议：
 
 - 放在鉴权之后或私有网络中
 - 不要无保护地直接暴露到公网
 - 优先使用只有你自己设备可达的隧道
+
+## Reply, Model, Access, and Uploads / 回复、模型、权限与上传
+
+English:
+
+When a desktop thread allows mobile reply, the composer supports:
+
+- model selection for the next reply only
+- access mode selection:
+  `read-only`, `workspace-write`, `danger-full-access`
+- image upload from the photo library
+- file upload from Files / iCloud Drive / local providers
+
+Uploaded files are copied into:
+
+```text
+<current-workspace>/.codex-mobile-uploads/<session-id>/
+```
+
+Images are passed to Codex using the real `--image` flag. Other uploaded files are saved in the workspace and referenced in the prompt sent to the same desktop thread.
+
+中文：
+
+当某个桌面线程允许移动端回写时，输入区支持：
+
+- 为下一次回复选择模型
+- 选择执行权限：
+  `read-only`、`workspace-write`、`danger-full-access`
+- 从系统照片库选择图片上传
+- 从文件 App / iCloud Drive / 本地文件提供方选择文件上传
+
+上传后的文件会被复制到：
+
+```text
+<当前工作区>/.codex-mobile-uploads/<session-id>/
+```
+
+图片会通过真实的 `--image` 参数传给 Codex。其他文件会先落到工作区，再把对应路径写入发往同一条桌面线程的 prompt。
 
 ## Troubleshooting / 故障排查
 
@@ -282,6 +326,8 @@ English:
   Verify the Mac and iPhone are on the same network, and test `http://YOUR_MAC_IP:8765/healthz`.
 - Board page does not show the expected project
   Set `CODEX_BRIDGE_BOARD_FOLDERS` or `CODEX_BRIDGE_BOARD_ROOTS` before starting the bridge.
+- Uploaded files are not visible in Git
+  They are stored under `.codex-mobile-uploads/`, which is ignored by the repository on purpose.
 
 中文：
 
@@ -295,12 +341,13 @@ English:
   确认 Mac 和 iPhone 在同一网络，并测试 `http://你的Mac局域网IP:8765/healthz`。
 - 看板页没有你想要的项目
   启动 bridge 前配置 `CODEX_BRIDGE_BOARD_FOLDERS` 或 `CODEX_BRIDGE_BOARD_ROOTS`。
+- 上传后的文件没有出现在 Git 里
+  它们会被存到 `.codex-mobile-uploads/`，该目录默认被仓库忽略，这是预期行为。
 
 ## API / 接口
 
 - `GET /healthz`
 - `GET /api/sessions`
-- `GET /api/projects`
 - `GET /api/board-folders`
 - `GET /api/sessions/{id}`
 - `POST /api/sessions/{id}/messages`
@@ -354,6 +401,7 @@ What is not included by default:
 - `python3 -m py_compile bridge/bridge_server.py`
 - `xcrun swiftc -sdk "$(xcrun --sdk iphoneos --show-sdk-path)" -target arm64-apple-ios17.0 -typecheck CodeXMobile/*.swift`
 - `xcodebuild -project CodeXMobile.xcodeproj -scheme CodeXMobile -configuration Debug -destination 'generic/platform=iOS Simulator' -derivedDataPath /tmp/CodeXMobileSim build`
+- `curl -X POST /api/sessions/{id}/messages -F text=... -F access_mode=read-only -F attachments=@file`
 
 ## Project Layout / 项目结构
 

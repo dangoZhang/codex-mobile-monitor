@@ -1024,6 +1024,9 @@ def board_scope_paths(
     target_repo_root: str | None,
     worktree_root: str | None = None,
 ) -> list[Path]:
+    board_name = board_root.name.strip().lower()
+    is_dedicated_coordination_dir = "coordination" in board_name and board_root.parent != board_root
+
     targets: list[Path] = []
     extra_roots = [
         str(board_root),
@@ -1034,7 +1037,10 @@ def board_scope_paths(
         if os.environ.get("CODEX_BRIDGE_INCLUDE_LEGACY_WORKTREE_ROOTS", "1") != "0"
         else None,
         str(board_root.parent)
-        if os.environ.get("CODEX_BRIDGE_INCLUDE_BOARD_PARENT_ROOT", "0") == "1"
+        if (
+            is_dedicated_coordination_dir
+            or os.environ.get("CODEX_BRIDGE_INCLUDE_BOARD_PARENT_ROOT", "0") == "1"
+        )
         else None,
     ]
 
@@ -1115,20 +1121,33 @@ def build_session_match_text(session: dict[str, Any]) -> tuple[str, str]:
 
 def build_session_match_cache(session: dict[str, Any]) -> None:
     if isinstance(session.get("_board_match_lines"), tuple) and isinstance(
-        session.get("_board_match_thread_ids"),
+        session.get("_board_match_identity_ids"),
         set,
     ):
         return
 
     raw_text, _normalized_text = build_session_match_text(session)
-    session["_board_match_lines"] = tuple(
+    lines = tuple(
         line.strip()
         for line in raw_text.splitlines()
         if line.strip()
     )
-    session["_board_match_thread_ids"] = set(
-        re.findall(r"(?<!codex/)\bthread\d+\b(?!-)", raw_text)
-    )
+    identity_ids: set[str] = set()
+    for line in lines:
+        lowered = line.lower()
+        match = re.search(
+            r"(?:^|[\s:])(?:you are(?: acting as)?|act as|you are acting as)\s+(thread\d+)\b",
+            lowered,
+        )
+        if match:
+            identity_ids.add(match.group(1))
+            continue
+        match = re.search(r"(?:^|[\s:])你是\s*(thread\d+)\b", lowered)
+        if match:
+            identity_ids.add(match.group(1))
+
+    session["_board_match_lines"] = lines
+    session["_board_match_identity_ids"] = identity_ids
 
 
 def match_thread_identity(session: dict[str, Any], thread_def: dict[str, Any]) -> int:
@@ -1137,16 +1156,16 @@ def match_thread_identity(session: dict[str, Any], thread_def: dict[str, Any]) -
         return 0
     build_session_match_cache(session)
     raw_lines = session.get("_board_match_lines")
-    standalone_thread_ids = session.get("_board_match_thread_ids")
+    identity_thread_ids = session.get("_board_match_identity_ids")
 
     best = 0
     thread_id = str(thread_def.get("id") or "").strip().lower()
     if thread_id:
-        if f"you are {thread_id}" in raw_text:
+        if f"you are {thread_id}" in raw_text or f"you are acting as {thread_id}" in raw_text:
             best = max(best, 900)
-        if isinstance(raw_lines, tuple) and any("act as" in line and thread_id in line for line in raw_lines):
-            best = max(best, 850)
-        if isinstance(standalone_thread_ids, set) and thread_id in standalone_thread_ids:
+        if f"你是{thread_id}" in raw_text or f"你是 {thread_id}" in raw_text:
+            best = max(best, 900)
+        if isinstance(identity_thread_ids, set) and thread_id in identity_thread_ids:
             best = max(best, 500)
 
     name = str(thread_def.get("name") or "").strip()
@@ -1439,6 +1458,10 @@ def read_board_snapshot(board_root: Path, session_summaries: list[dict[str, Any]
             totals["todo"] += 1
 
     columns: list[dict[str, Any]] = []
+    selected_tasks = {
+        thread_id: select_board_task(thread_id, tasks)
+        for thread_id in thread_index
+    }
     for status in BOARD_STATUS_ORDER:
         column_tasks = [
             serialize_board_task(
@@ -1449,7 +1472,9 @@ def read_board_snapshot(board_root: Path, session_summaries: list[dict[str, Any]
                 annotate_runtime_snapshot(
                     runtime_index.get(task.thread),
                     logs["latest"].get(task.thread),
-                ),
+                )
+                if selected_tasks.get(task.thread) is not None and selected_tasks[task.thread].id == task.id
+                else None,
             )
             for task in tasks
             if task.status == status
@@ -1786,22 +1811,6 @@ class SessionStore:
                 pass
             await asyncio.sleep(self.poll_interval)
 
-    async def create_session(self, title: str | None = None) -> ChatSession:
-        async with self.lock:
-            now = utc_now()
-            session_id = str(uuid.uuid4())
-            session = ChatSession(
-                id=session_id,
-                title=title.strip() if title and title.strip() else f"Bridge Chat {len(self.sessions) + 1}",
-                created_at=now,
-                updated_at=now,
-                source="bridge",
-                data_source="bridge",
-                bridge_reply_available=True,
-            )
-            self.sessions[session.id] = session
-            return session
-
     async def get_session(self, session_id: str) -> ChatSession | None:
         async with self.lock:
             return self.sessions.get(session_id)
@@ -1814,11 +1823,6 @@ class SessionStore:
                 reverse=True,
             )
             return [session.summary() for session in sessions]
-
-    async def list_projects(self) -> list[dict[str, str]]:
-        if not self.threads_db_path.exists():
-            return []
-        return await asyncio.to_thread(read_recent_projects_from_sqlite, self.threads_db_path, self.scan_limit)
 
     async def list_board_runtime_sessions(self, board_root: Path) -> list[dict[str, Any]]:
         live_sessions = await self.list_sessions()
@@ -1842,6 +1846,9 @@ class SessionStore:
         for session in live_sessions:
             session_id = session.get("id")
             if isinstance(session_id, str):
+                cwd = str(session.get("cwd") or "")
+                if not path_belongs_to_board_scope(cwd, board_root, target_repo_root, worktree_root):
+                    continue
                 existing = merged.get(session_id, {})
                 merged[session_id] = {
                     **existing,
@@ -2246,7 +2253,6 @@ async def handle_root(request: web.Request) -> web.Response:
             "routes": [
                 "/healthz",
                 "/api/sessions",
-                "/api/projects",
                 "/api/board-folders",
                 "/api/sessions/{id}",
                 "/api/sessions/{id}/messages",
@@ -2261,20 +2267,6 @@ async def handle_root(request: web.Request) -> web.Response:
 async def handle_list_sessions(request: web.Request) -> web.Response:
     store: SessionStore = request.app["store"]
     return json_response({"sessions": await store.list_sessions()})
-
-
-async def handle_list_projects(request: web.Request) -> web.Response:
-    store: SessionStore = request.app["store"]
-    return json_response({"projects": await store.list_projects()})
-
-
-async def handle_create_session(request: web.Request) -> web.Response:
-    store: SessionStore = request.app["store"]
-    payload = await request.json() if request.can_read_body else {}
-    title = payload.get("title") if isinstance(payload, dict) else None
-    session = await store.create_session(title=title)
-    await store.publish(session, "session.created", {"session": session.summary()})
-    return json_response(session.detail(), status=201)
 
 
 async def handle_get_session(request: web.Request) -> web.Response:
@@ -2492,9 +2484,7 @@ def create_app() -> web.Application:
     app.router.add_get("/", handle_root)
     app.router.add_get("/healthz", handle_health)
     app.router.add_get("/api/sessions", handle_list_sessions)
-    app.router.add_get("/api/projects", handle_list_projects)
     app.router.add_get("/api/board-folders", handle_list_board_folders)
-    app.router.add_post("/api/sessions", handle_create_session)
     app.router.add_get("/api/sessions/{session_id}", handle_get_session)
     app.router.add_post("/api/sessions/{session_id}/messages", handle_send_message)
     app.router.add_get("/api/sessions/{session_id}/events", handle_events)

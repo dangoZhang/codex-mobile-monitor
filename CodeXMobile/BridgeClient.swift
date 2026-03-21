@@ -1,11 +1,17 @@
 import Foundation
 
-struct CreateSessionBody: Encodable {
-    let title: String?
-}
-
 struct SendMessageBody: Encodable {
     let text: String
+    let model: String?
+    let accessMode: String?
+    let cwd: String?
+
+    enum CodingKeys: String, CodingKey {
+        case text
+        case model
+        case accessMode = "access_mode"
+        case cwd
+    }
 }
 
 enum BridgeError: LocalizedError {
@@ -43,22 +49,6 @@ final class BridgeClient {
         let (data, response) = try await session.data(from: baseURL.bridgeEndpoint("api/sessions"))
         try validate(response: response, data: data)
         return try decoder.decode(SessionListResponse.self, from: data).sessions
-    }
-
-    func fetchProjects(baseURL: URL) async throws -> [ProjectSummary] {
-        let (data, response) = try await session.data(from: baseURL.bridgeEndpoint("api/projects"))
-        try validate(response: response, data: data)
-        return try decoder.decode(ProjectListResponse.self, from: data).projects
-    }
-
-    func createSession(baseURL: URL, title: String? = nil) async throws -> SessionDetail {
-        var request = URLRequest(url: baseURL.bridgeEndpoint("api/sessions"))
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try encoder.encode(CreateSessionBody(title: title))
-        let (data, response) = try await session.data(for: request)
-        try validate(response: response, data: data)
-        return try decoder.decode(SessionDetail.self, from: data)
     }
 
     func fetchSession(baseURL: URL, sessionID: String) async throws -> SessionDetail {
@@ -100,11 +90,39 @@ final class BridgeClient {
         return try decoder.decode(BoardDetail.self, from: data)
     }
 
-    func sendMessage(baseURL: URL, sessionID: String, text: String) async throws {
+    func sendMessage(
+        baseURL: URL,
+        sessionID: String,
+        text: String,
+        model: String?,
+        accessMode: String?,
+        cwd: String?,
+        attachments: [DraftAttachment]
+    ) async throws {
         var request = URLRequest(url: baseURL.bridgeEndpoint("api/sessions/\(sessionID)/messages"))
         request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try encoder.encode(SendMessageBody(text: text))
+        if attachments.isEmpty {
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = try encoder.encode(
+                SendMessageBody(
+                    text: text,
+                    model: model,
+                    accessMode: accessMode,
+                    cwd: cwd
+                )
+            )
+        } else {
+            let boundary = "CodeXMobile-\(UUID().uuidString)"
+            request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+            request.httpBody = try makeMultipartBody(
+                boundary: boundary,
+                text: text,
+                model: model,
+                accessMode: accessMode,
+                cwd: cwd,
+                attachments: attachments
+            )
+        }
         let (data, response) = try await session.data(for: request)
         try validate(response: response, data: data)
     }
@@ -173,6 +191,41 @@ final class BridgeClient {
             throw BridgeError.server("Bridge 返回状态码 \(http.statusCode)")
         }
     }
+
+    private func makeMultipartBody(
+        boundary: String,
+        text: String,
+        model: String?,
+        accessMode: String?,
+        cwd: String?,
+        attachments: [DraftAttachment]
+    ) throws -> Data {
+        var body = Data()
+        let fields = [
+            ("text", text),
+            ("model", model ?? ""),
+            ("access_mode", accessMode ?? ""),
+            ("cwd", cwd ?? "")
+        ]
+
+        for (name, value) in fields where !value.isEmpty {
+            body.appendFormField(named: name, value: value, boundary: boundary)
+        }
+
+        for attachment in attachments {
+            let data = try Data(contentsOf: attachment.fileURL)
+            body.appendFileField(
+                named: "attachments",
+                filename: attachment.displayName,
+                mimeType: attachment.contentType,
+                data: data,
+                boundary: boundary
+            )
+        }
+
+        body.appendString("--\(boundary)--\r\n")
+        return body
+    }
 }
 
 private extension JSONDecoder.DateDecodingStrategy {
@@ -207,5 +260,25 @@ private extension URL {
             .reduce(self) { partial, component in
                 partial.appendingPathComponent(String(component))
             }
+    }
+}
+
+private extension Data {
+    mutating func appendString(_ value: String) {
+        append(Data(value.utf8))
+    }
+
+    mutating func appendFormField(named name: String, value: String, boundary: String) {
+        appendString("--\(boundary)\r\n")
+        appendString("Content-Disposition: form-data; name=\"\(name)\"\r\n\r\n")
+        appendString("\(value)\r\n")
+    }
+
+    mutating func appendFileField(named name: String, filename: String, mimeType: String, data: Data, boundary: String) {
+        appendString("--\(boundary)\r\n")
+        appendString("Content-Disposition: form-data; name=\"\(name)\"; filename=\"\(filename)\"\r\n")
+        appendString("Content-Type: \(mimeType)\r\n\r\n")
+        append(data)
+        appendString("\r\n")
     }
 }

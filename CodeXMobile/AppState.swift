@@ -18,7 +18,6 @@ final class AppState: ObservableObject {
     @Published var selectedAccessMode = ComposerAccessMode.workspaceWrite
     @Published var draftAttachments: [DraftAttachment] = []
     @Published var sessions: [SessionSummary] = []
-    @Published var projects: [ProjectSummary] = []
     @Published var selectedSessionID: String?
     @Published var messages: [ChatMessage] = []
     @Published var draft: String = ""
@@ -83,9 +82,7 @@ final class AppState: ObservableObject {
         defer { isLoading = false }
         do {
             let fetched = try await bridge.fetchSessions(baseURL: baseURL)
-            let fetchedProjects = try await bridge.fetchProjects(baseURL: baseURL)
             sessions = fetched
-            projects = fetchedProjects
             if let selectedSessionID, fetched.contains(where: { $0.id == selectedSessionID }) {
                 await loadSession(id: selectedSessionID, reconnect: false)
             } else if selectFirst, let first = fetched.first {
@@ -94,52 +91,6 @@ final class AppState: ObservableObject {
                 selectedSessionID = nil
                 messages = []
             }
-            errorMessage = nil
-        } catch {
-            errorMessage = error.localizedDescription
-        }
-    }
-
-    func createSession() async {
-        guard let baseURL else {
-            errorMessage = "先填写 Mac Bridge 地址"
-            return
-        }
-        isLoading = true
-        defer { isLoading = false }
-        do {
-            let detail = try await bridge.createSession(baseURL: baseURL)
-            let summary = SessionSummary(
-                id: detail.id,
-                title: detail.title,
-                createdAt: detail.createdAt,
-                updatedAt: detail.updatedAt,
-                threadID: detail.threadID,
-                cwd: detail.cwd,
-                projectRoot: detail.projectRoot,
-                projectName: detail.projectName,
-                source: detail.source,
-                sourceKind: detail.sourceKind,
-                gitBranch: detail.gitBranch,
-                originator: detail.originator,
-                imported: detail.imported,
-                desktopThread: detail.desktopThread,
-                dataSource: detail.dataSource,
-                rolloutPath: detail.rolloutPath,
-                modelProvider: detail.modelProvider,
-                cliVersion: detail.cliVersion,
-                parentThreadID: detail.parentThreadID,
-                sourceDepth: detail.sourceDepth,
-                agentNickname: detail.agentNickname,
-                agentRole: detail.agentRole,
-                bridgeReplyAvailable: detail.bridgeReplyAvailable,
-                running: detail.running,
-                messageCount: detail.messageCount,
-                lastMessagePreview: detail.lastMessagePreview
-            )
-            sessions.insert(summary, at: 0)
-            apply(detail: detail)
-            connectStream(for: detail.id, after: detail.lastEventSequence)
             errorMessage = nil
         } catch {
             errorMessage = error.localizedDescription

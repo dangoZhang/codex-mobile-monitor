@@ -28,7 +28,6 @@ private struct SessionProjectBucket: Identifiable, Hashable {
     let path: String?
     let updatedAt: Date?
     let sessions: [SessionSummary]
-    let projectOnly: Bool
 }
 
 private struct ResponsiveCodexShellView: View {
@@ -90,7 +89,6 @@ private struct ResponsiveCodexShellView: View {
                 selection: selection,
                 monitorState: monitorState,
                 boardState: boardState,
-                onNewThread: createNewThread,
                 onSelectRoute: selectRoute,
                 onSelectSession: selectSession
             )
@@ -129,7 +127,6 @@ private struct ResponsiveCodexShellView: View {
                     selection: selection,
                     monitorState: monitorState,
                     boardState: boardState,
-                    onNewThread: createNewThread,
                     onSelectRoute: { route in
                         selectRoute(route)
                         isCompactSidebarPresented = false
@@ -215,17 +212,6 @@ private struct ResponsiveCodexShellView: View {
         }
     }
 
-    private func createNewThread() {
-        Task {
-            await monitorState.createSession()
-            if let sessionID = monitorState.selectedSessionID {
-                selection = .session(sessionID)
-                hasResolvedInitialSelection = true
-            }
-            isCompactSidebarPresented = false
-        }
-    }
-
     private func selectRoute(_ route: ShellRoute) {
         selection = route
         hasResolvedInitialSelection = true
@@ -255,7 +241,6 @@ private struct ShellSidebarView: View {
     let selection: ShellRoute?
     @ObservedObject var monitorState: AppState
     @ObservedObject var boardState: BoardState
-    let onNewThread: () -> Void
     let onSelectRoute: (ShellRoute) -> Void
     let onSelectSession: (String) -> Void
 
@@ -264,7 +249,7 @@ private struct ShellSidebarView: View {
     }
 
     private var projectBuckets: [SessionProjectBucket] {
-        bucketizeSessions(monitorState.sessions, knownProjects: monitorState.projects)
+        bucketizeSessions(monitorState.sessions)
     }
 
     var body: some View {
@@ -290,7 +275,7 @@ private struct ShellSidebarView: View {
                         }
                     }
 
-                    sectionHeader("线程", showsControls: true)
+                    sectionHeader("线程")
 
                     if projectBuckets.isEmpty {
                         EmptySidebarStateView()
@@ -364,12 +349,6 @@ private struct ShellSidebarView: View {
     private var quickActions: some View {
         VStack(alignment: .leading, spacing: 4) {
             SidebarActionButton(
-                icon: "square.and.pencil",
-                title: "新线程",
-                selected: false,
-                action: onNewThread
-            )
-            SidebarActionButton(
                 icon: "rectangle.grid.1x2",
                 title: "看板",
                 selected: selection == .boards,
@@ -378,21 +357,13 @@ private struct ShellSidebarView: View {
         }
     }
 
-    private func sectionHeader(_ title: String, showsControls: Bool = false) -> some View {
+    private func sectionHeader(_ title: String) -> some View {
         HStack(spacing: 10) {
             Text(title)
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundStyle(CodexPalette.subtleText)
                 .textCase(.uppercase)
             Spacer()
-            if showsControls {
-                Image(systemName: "folder.badge.plus")
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundStyle(CodexPalette.subtleText)
-                Image(systemName: "line.3.horizontal.decrease")
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundStyle(CodexPalette.subtleText)
-            }
         }
     }
 }
@@ -983,12 +954,6 @@ private struct SidebarProjectBucketView: View {
                     .foregroundStyle(CodexPalette.subtleText)
                     .padding(.leading, 12)
                     .padding(.vertical, 6)
-                if bucket.projectOnly {
-                    Text("来自 Codex 最近项目历史")
-                        .font(.system(size: 11, weight: .regular))
-                        .foregroundStyle(CodexPalette.subtleText)
-                        .padding(.leading, 12)
-                }
             } else {
                 VStack(spacing: 2) {
                     ForEach(bucket.sessions) { session in
@@ -1053,18 +1018,11 @@ private struct SidebarThreadRowView: View {
     }()
 }
 
-private func bucketizeSessions(_ sessions: [SessionSummary], knownProjects: [ProjectSummary]) -> [SessionProjectBucket] {
+private func bucketizeSessions(_ sessions: [SessionSummary]) -> [SessionProjectBucket] {
     var grouped: [String: [SessionSummary]] = [:]
     var names: [String: String] = [:]
     var paths: [String: String?] = [:]
     var updatedAt: [String: Date] = [:]
-
-    for project in knownProjects {
-        grouped[project.id, default: []] = grouped[project.id, default: []]
-        names[project.id] = project.name
-        paths[project.id] = project.path
-        updatedAt[project.id] = project.updatedAt
-    }
 
     for session in sessions {
         let identity = projectIdentity(for: session)
@@ -1081,8 +1039,7 @@ private func bucketizeSessions(_ sessions: [SessionSummary], knownProjects: [Pro
                 name: names[key] ?? key,
                 path: paths[key] ?? nil,
                 updatedAt: updatedAt[key],
-                sessions: value.sorted { $0.updatedAt > $1.updatedAt },
-                projectOnly: value.isEmpty
+                sessions: value.sorted { $0.updatedAt > $1.updatedAt }
             )
         }
         .sorted {

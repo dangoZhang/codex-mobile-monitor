@@ -75,24 +75,6 @@ struct SessionListResponse: Decodable {
     let sessions: [SessionSummary]
 }
 
-struct ProjectListResponse: Decodable {
-    let projects: [ProjectSummary]
-}
-
-struct ProjectSummary: Decodable, Identifiable, Hashable {
-    let id: String
-    let name: String
-    let path: String
-    let updatedAt: Date
-
-    private enum CodingKeys: String, CodingKey {
-        case id
-        case name
-        case path
-        case updatedAt = "updated_at"
-    }
-}
-
 struct SessionSummary: Decodable, Identifiable, Hashable {
     let id: String
     let title: String
