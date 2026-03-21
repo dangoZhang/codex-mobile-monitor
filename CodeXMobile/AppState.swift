@@ -12,6 +12,8 @@ private enum BridgeURLParser {
 
 @MainActor
 final class AppState: ObservableObject {
+    private static let refreshLoopIntervalNanoseconds: UInt64 = 6_000_000_000
+
     @Published var selectedModel = ComposerModelOption.automatic
     @Published var selectedAccessMode = ComposerAccessMode.workspaceWrite
     @Published var draftAttachments: [DraftAttachment] = []
@@ -46,6 +48,7 @@ final class AppState: ObservableObject {
 
     private let bridge = BridgeClient()
     private var streamTask: Task<Void, Never>?
+    private var refreshTask: Task<Void, Never>?
     private var cursors: [String: Int] = [:]
     private(set) var baseURL: URL?
 
@@ -63,9 +66,11 @@ final class AppState: ObservableObject {
     func updateBridgeURL(_ raw: String) {
         UserDefaults.standard.set(raw, forKey: "bridge_url")
         baseURL = BridgeURLParser.makeBaseURL(from: raw)
+        restartAutoRefreshLoop()
     }
 
     func bootstrap() async {
+        restartAutoRefreshLoop()
         await refreshSessions(selectFirst: true)
     }
 
@@ -311,6 +316,13 @@ final class AppState: ObservableObject {
         if Task.isCancelled { return }
         statusText = "Disconnected"
         errorMessage = error.localizedDescription
+        guard let selectedSessionID else { return }
+        let after = cursors[selectedSessionID] ?? 0
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            guard self.selectedSessionID == selectedSessionID else { return }
+            self.connectStream(for: selectedSessionID, after: after)
+        }
     }
 
     private func handle(event: BridgeEvent) {
@@ -386,6 +398,20 @@ final class AppState: ObservableObject {
         sessions.sort { $0.updatedAt > $1.updatedAt }
     }
 
+    private func restartAutoRefreshLoop() {
+        refreshTask?.cancel()
+        guard baseURL != nil else { return }
+
+        refreshTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: Self.refreshLoopIntervalNanoseconds)
+                if Task.isCancelled { break }
+                await self.refreshSessions(selectFirst: false)
+            }
+        }
+    }
+
 }
 
 private extension AppState {
@@ -425,6 +451,8 @@ private extension AppState {
 
 @MainActor
 final class BoardState: ObservableObject {
+    private static let refreshLoopIntervalNanoseconds: UInt64 = 8_000_000_000
+
     @Published var folders: [BoardFolderSummary] = []
     @Published var selectedFolderPath: String?
     @Published var boards: [BoardSummary] = []
@@ -434,6 +462,7 @@ final class BoardState: ObservableObject {
     @Published var errorMessage: String?
 
     private let bridge = BridgeClient()
+    private var refreshTask: Task<Void, Never>?
     private(set) var baseURL: URL?
 
     init() {
@@ -445,9 +474,11 @@ final class BoardState: ObservableObject {
     func updateBridgeURL(_ raw: String) {
         UserDefaults.standard.set(raw, forKey: "bridge_url")
         baseURL = BridgeURLParser.makeBaseURL(from: raw)
+        restartAutoRefreshLoop()
     }
 
     func bootstrap() async {
+        restartAutoRefreshLoop()
         await refreshBoards(selectFirst: true)
     }
 
@@ -513,6 +544,20 @@ final class BoardState: ObservableObject {
             errorMessage = nil
         } catch {
             errorMessage = error.localizedDescription
+        }
+    }
+
+    private func restartAutoRefreshLoop() {
+        refreshTask?.cancel()
+        guard baseURL != nil else { return }
+
+        refreshTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: Self.refreshLoopIntervalNanoseconds)
+                if Task.isCancelled { break }
+                await self.refreshBoards(selectFirst: false)
+            }
         }
     }
 }

@@ -5,6 +5,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from bridge.bridge_server import (
@@ -12,9 +13,11 @@ from bridge.bridge_server import (
     SessionStore,
     annotate_runtime_snapshot,
     build_board_runtime_index,
+    extract_runtime_thread_id,
     parse_rollout_delta,
     read_board_runtime_sessions_from_sqlite,
     read_threads_from_sqlite,
+    resolve_codex_command,
 )
 
 
@@ -201,6 +204,40 @@ class BridgeServerTests(unittest.TestCase):
             self.assertEqual(delta.messages[1].text, '{"completed": "done"}')
             self.assertEqual(delta.messages[2].text, "search\ncodex subagent")
 
+    def test_extract_runtime_thread_id_accepts_resume_events(self) -> None:
+        self.assertEqual(
+            extract_runtime_thread_id({"type": "thread.resumed", "thread_id": "thread-123"}),
+            "thread-123",
+        )
+        self.assertEqual(
+            extract_runtime_thread_id({"type": "session.resumed", "session_id": "thread-456"}),
+            "thread-456",
+        )
+        self.assertIsNone(extract_runtime_thread_id({"type": "response.output_text.delta", "thread_id": "ignored"}))
+
+    def test_resolve_codex_command_prefers_explicit_env(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {
+                "CODEX_BRIDGE_CODEX_COMMAND": "/tmp/codex --profile desktop",
+                "CODEX_BRIDGE_CODEX_ARGS": "--enable subagents --disable legacy_mode",
+            },
+            clear=False,
+        ):
+            command = resolve_codex_command()
+        self.assertEqual(
+            command,
+            (
+                "/tmp/codex",
+                "--profile",
+                "desktop",
+                "--enable",
+                "subagents",
+                "--disable",
+                "legacy_mode",
+            ),
+        )
+
     def test_read_board_runtime_sessions_from_sqlite_covers_board_parent_and_worktrees(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
@@ -356,6 +393,8 @@ class BridgeServerTests(unittest.TestCase):
             store = SessionStore(
                 workspace=root,
                 codex_home=root,
+                codex_command=("codex",),
+                codex_version="codex-cli 0.116.0-alpha.10",
                 threads_db_path=db_path,
                 scan_limit=60,
                 poll_interval=1.0,

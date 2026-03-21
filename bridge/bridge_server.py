@@ -7,6 +7,8 @@ import json
 import mimetypes
 import os
 import re
+import shlex
+import shutil
 import sqlite3
 import subprocess
 import tempfile
@@ -31,6 +33,10 @@ BOARD_STATUS_TITLES = {
 UPLOAD_ROOT_NAME = ".codex-mobile-uploads"
 DEFAULT_ATTACHMENT_PROMPT = "Please inspect the uploaded files from CodeX Mobile and continue this desktop thread."
 DEFAULT_ALLOWED_SOURCE_KINDS = "vscode,app,exec,subagent"
+DEFAULT_CODEX_CANDIDATE_PATHS = (
+    "/Applications/Codex.app/Contents/Resources/codex",
+    str(Path.home() / "Applications" / "Codex.app" / "Contents" / "Resources" / "codex"),
+)
 
 
 def utc_now() -> str:
@@ -311,6 +317,60 @@ def normalize_access_mode(value: str | None) -> str:
     if cleaned in {"danger-full-access", "danger", "full-access", "full_access"}:
         return "danger-full-access"
     return "workspace-write"
+
+
+def resolve_codex_command() -> tuple[str, ...]:
+    explicit_command = os.environ.get("CODEX_BRIDGE_CODEX_COMMAND", "").strip()
+    explicit_bin = os.environ.get("CODEX_BRIDGE_CODEX_BIN", "").strip()
+    explicit_args = os.environ.get("CODEX_BRIDGE_CODEX_ARGS", "").strip()
+
+    if explicit_command:
+        base = tuple(part for part in shlex.split(explicit_command) if part.strip())
+    elif explicit_bin:
+        base = (explicit_bin,)
+    else:
+        discovered = next(
+            (
+                candidate
+                for candidate in DEFAULT_CODEX_CANDIDATE_PATHS
+                if Path(candidate).expanduser().exists()
+            ),
+            shutil.which("codex") or "codex",
+        )
+        base = (discovered,)
+
+    extra = tuple(part for part in shlex.split(explicit_args) if part.strip())
+    return (*base, *extra)
+
+
+def probe_codex_version(command: tuple[str, ...]) -> str | None:
+    if not command:
+        return None
+    with contextlib.suppress(Exception):
+        result = subprocess.run(
+            [*command, "--version"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip() or result.stderr.strip() or None
+    return None
+
+
+def extract_runtime_thread_id(payload: dict[str, Any]) -> str | None:
+    event_type = str(payload.get("type") or "").strip().lower()
+    candidate_keys = ("thread_id", "session_id", "conversation_id")
+    if event_type in {"thread.started", "thread.resumed", "session.started", "session.resumed"}:
+        for key in candidate_keys:
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    if event_type == "thread.started":
+        value = payload.get("thread_id")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
 
 
 def is_image_attachment(filename: str, content_type: str | None) -> bool:
@@ -1683,6 +1743,8 @@ class SessionStore:
         self,
         workspace: Path,
         codex_home: Path,
+        codex_command: tuple[str, ...],
+        codex_version: str | None,
         threads_db_path: Path,
         scan_limit: int,
         poll_interval: float,
@@ -1692,6 +1754,8 @@ class SessionStore:
     ) -> None:
         self.workspace = workspace
         self.codex_home = codex_home
+        self.codex_command = codex_command
+        self.codex_version = codex_version
         self.threads_db_path = threads_db_path
         self.scan_limit = scan_limit
         self.poll_interval = poll_interval
@@ -2081,7 +2145,7 @@ async def run_codex(
 
     try:
         command = [
-            "codex",
+            *store.codex_command,
             "exec",
             "--json",
             "--skip-git-repo-check",
@@ -2122,8 +2186,9 @@ async def run_codex(
             payload = maybe_parse_json(line)
             if payload is not None:
                 await store.publish(session, "run.event", payload)
-                if payload.get("type") == "thread.started" and isinstance(payload.get("thread_id"), str):
-                    session.thread_id = payload["thread_id"]
+                resumed_thread_id = extract_runtime_thread_id(payload)
+                if resumed_thread_id:
+                    session.thread_id = resumed_thread_id
                     await store.publish(session, "session.thread", {"thread_id": session.thread_id})
             elif line:
                 await store.publish(session, "run.output", {"line": line})
@@ -2159,6 +2224,8 @@ async def handle_health(request: web.Request) -> web.Response:
             "timestamp": utc_now(),
             "session_count": len(store.sessions),
             "board_count": board_count,
+            "codex_command": list(store.codex_command),
+            "codex_version": store.codex_version,
             "allowed_sources": sorted(store.allowed_sources),
         }
     )
@@ -2174,6 +2241,8 @@ async def handle_root(request: web.Request) -> web.Response:
             "allowed_sources": sorted(store.allowed_sources),
             "session_count": len(store.sessions),
             "board_count": board_count,
+            "codex_command": list(store.codex_command),
+            "codex_version": store.codex_version,
             "routes": [
                 "/healthz",
                 "/api/sessions",
@@ -2382,6 +2451,8 @@ async def on_cleanup(app: web.Application) -> None:
 def create_app() -> web.Application:
     workspace = Path(os.environ.get("CODEX_BRIDGE_CWD", os.getcwd())).expanduser().resolve()
     codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser().resolve()
+    codex_command = resolve_codex_command()
+    codex_version = probe_codex_version(codex_command)
     threads_db_path = Path(os.environ.get("CODEX_BRIDGE_THREADS_DB", codex_home / "state_5.sqlite")).expanduser().resolve()
     scan_limit = int(os.environ.get("CODEX_BRIDGE_IMPORT_LIMIT", "60"))
     poll_interval = float(os.environ.get("CODEX_BRIDGE_POLL_SECONDS", "2"))
@@ -2404,6 +2475,8 @@ def create_app() -> web.Application:
     store = SessionStore(
         workspace=workspace,
         codex_home=codex_home,
+        codex_command=codex_command,
+        codex_version=codex_version,
         threads_db_path=threads_db_path,
         scan_limit=scan_limit,
         poll_interval=poll_interval,
