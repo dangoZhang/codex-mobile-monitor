@@ -1047,6 +1047,63 @@ class BridgeServerTests(unittest.TestCase):
             self.assertIsNotNone(current_task["runtime"])
             self.assertTrue(current_task["runtime"]["running"])
 
+    def test_read_board_snapshot_prefers_newer_comm_log_task_when_task_board_lags(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            board_root = root / "codex_coordination"
+            board_root.mkdir()
+            (board_root / "THREADS.json").write_text(
+                json.dumps(
+                    [{"id": "thread1", "slot": "01", "name": "01-Backbone", "role": "Backend"}],
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            (board_root / "TASK_BOARD.md").write_text(
+                "\n".join(
+                    [
+                        "# Task Board",
+                        "",
+                        "| ID | Thread | Task | Owner | Status | Depends On | Output |",
+                        "|---|---|---|---|---|---|---|",
+                        "| T1-FIX-064 | thread1 | Older task | thread1 | IN_PROGRESS | - | old |",
+                        "| T1-FIX-065 | thread1 | Interim task | thread1 | DONE | - | mid |",
+                        "| T1-FIX-066 | thread1 | Newer task | thread1 | DONE | - | new |",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            (board_root / "COMM_LOG.md").write_text(
+                "\n".join(
+                    [
+                        "[2026-03-21 14:32] [thread1] [type: kickoff] Claimed T1-FIX-066 on persistent branch after fresh rerun evidence.",
+                        "[2026-03-21 15:12] [thread1] [type: handoff] Filed H-T1-T3-053 for review of T1-FIX-066 after focused verification.",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            snapshot = read_board_snapshot(board_root, session_summaries=[])
+
+            thread_snapshot = snapshot["threads"][0]
+            self.assertIsNotNone(thread_snapshot["task"])
+            assert thread_snapshot["task"] is not None
+            self.assertEqual(thread_snapshot["task"]["id"], "T1-FIX-066")
+            self.assertEqual(thread_snapshot["task"]["status"], "DONE")
+
+            in_progress_task = next(
+                task for column in snapshot["columns"] if column["status"] == "IN_PROGRESS" for task in column["tasks"]
+            )
+            done_ids = [
+                task["id"]
+                for column in snapshot["columns"]
+                if column["status"] == "DONE"
+                for task in column["tasks"]
+            ]
+            self.assertEqual(in_progress_task["id"], "T1-FIX-064")
+            self.assertIn("T1-FIX-066", done_ids)
+
     def test_annotate_runtime_snapshot_marks_stale_when_board_log_is_newer(self) -> None:
         runtime = {
             "session_count": 1,

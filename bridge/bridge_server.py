@@ -29,6 +29,7 @@ BOARD_STATUS_TITLES = {
     "TODO": "Todo",
     "DONE": "Done",
 }
+BOARD_TASK_ID_PATTERN = re.compile(r"\bT\d+-[A-Z]+-\d+\b")
 
 UPLOAD_ROOT_NAME = ".codex-mobile-uploads"
 DEFAULT_ATTACHMENT_PROMPT = "Please inspect the uploaded files from CodeX Mobile and continue this desktop thread."
@@ -89,6 +90,11 @@ def parse_board_log_timestamp(value: str | None) -> datetime | None:
         return datetime.strptime(cleaned, "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
     except ValueError:
         return None
+
+
+def extract_board_task_id(message: str | None) -> str | None:
+    match = BOARD_TASK_ID_PATTERN.search(str(message or ""))
+    return match.group(0) if match else None
 
 
 def role_event_type(role: str) -> str:
@@ -944,6 +950,8 @@ def parse_board_tasks(path: Path) -> list[BoardTaskRecord]:
 def parse_board_comm_log(path: Path) -> dict[str, dict[str, dict[str, Any]]]:
     latest: dict[str, dict[str, Any]] = {}
     kickoff_latest: dict[str, dict[str, Any]] = {}
+    latest_task: dict[str, dict[str, Any]] = {}
+    kickoff_task_latest: dict[str, dict[str, Any]] = {}
     last_invocation: dict[str, dict[str, Any]] = {}
     active_kickoff: dict[str, tuple[dict[str, Any], datetime]] = {}
     in_code_block = False
@@ -973,20 +981,39 @@ def parse_board_comm_log(path: Path) -> dict[str, dict[str, dict[str, Any]]]:
         except ValueError:
             parsed_ts = None
 
+        referenced_task_id = extract_board_task_id(message)
         latest[thread] = {
             "timestamp": ts,
             "type": kind,
             "message": message,
             "line_no": idx,
+            "task_id": referenced_task_id,
         }
+        if referenced_task_id:
+            latest_task[thread] = {
+                "task_id": referenced_task_id,
+                "timestamp": ts,
+                "type": kind,
+                "message": message,
+                "line_no": idx,
+            }
 
         if kind == "kickoff":
             kickoff = {
                 "timestamp": ts,
                 "message": message,
                 "line_no": idx,
+                "task_id": referenced_task_id,
             }
             kickoff_latest[thread] = kickoff
+            if referenced_task_id:
+                kickoff_task_latest[thread] = {
+                    "task_id": referenced_task_id,
+                    "timestamp": ts,
+                    "type": kind,
+                    "message": message,
+                    "line_no": idx,
+                }
             if parsed_ts is not None:
                 active_kickoff[thread] = (kickoff, parsed_ts)
             else:
@@ -1009,6 +1036,8 @@ def parse_board_comm_log(path: Path) -> dict[str, dict[str, dict[str, Any]]]:
     return {
         "latest": latest,
         "kickoff_latest": kickoff_latest,
+        "latest_task": latest_task,
+        "kickoff_task_latest": kickoff_task_latest,
         "last_invocation": last_invocation,
     }
 
@@ -1448,13 +1477,34 @@ def build_board_repo_snapshot(
     )
 
 
-def select_board_task(thread_id: str, tasks: list[BoardTaskRecord]) -> BoardTaskRecord | None:
+def board_log_selected_task_id(thread_id: str, logs: dict[str, dict[str, dict[str, Any]]]) -> str | None:
+    kickoff_task = logs.get("kickoff_task_latest", {}).get(thread_id)
+    if isinstance(kickoff_task, dict) and str(kickoff_task.get("task_id") or "").strip():
+        return str(kickoff_task["task_id"])
+    latest_task = logs.get("latest_task", {}).get(thread_id)
+    if isinstance(latest_task, dict) and str(latest_task.get("task_id") or "").strip():
+        return str(latest_task["task_id"])
+    return None
+
+
+def select_board_task(
+    thread_id: str,
+    tasks: list[BoardTaskRecord],
+    preferred_task_id: str | None = None,
+) -> BoardTaskRecord | None:
     thread_tasks = [task for task in tasks if task.thread == thread_id]
+    selected: BoardTaskRecord | None = None
     for status in BOARD_STATUS_ORDER:
         matches = [task for task in thread_tasks if task.status == status]
         if matches:
-            return matches[-1]
-    return None
+            selected = matches[-1]
+            break
+
+    if preferred_task_id:
+        preferred = next((task for task in thread_tasks if task.id == preferred_task_id), None)
+        if preferred is not None and (selected is None or preferred.line_no >= selected.line_no):
+            return preferred
+    return selected
 
 
 def serialize_board_task(
@@ -1545,7 +1595,11 @@ def read_board_snapshot(board_root: Path, session_summaries: list[dict[str, Any]
 
     columns: list[dict[str, Any]] = []
     selected_tasks = {
-        thread_id: select_board_task(thread_id, tasks)
+        thread_id: select_board_task(
+            thread_id,
+            tasks,
+            preferred_task_id=board_log_selected_task_id(thread_id, logs),
+        )
         for thread_id in thread_index
     }
     for status in BOARD_STATUS_ORDER:
@@ -1578,7 +1632,7 @@ def read_board_snapshot(board_root: Path, session_summaries: list[dict[str, Any]
     threads: list[dict[str, Any]] = []
     for row in sorted(thread_defs, key=lambda item: str(item.get("slot") or item.get("id") or "")):
         thread_id = str(row.get("id") or "")
-        selected_task = select_board_task(thread_id, tasks)
+        selected_task = selected_tasks.get(thread_id)
         threads.append(
             {
                 "thread": thread_id,
