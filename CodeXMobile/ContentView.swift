@@ -487,7 +487,7 @@ private struct MonitorWorkspaceDetailView: View {
                         .disabled(!state.bridgeReplyAvailable)
 
                     if state.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        Text(state.bridgeReplyAvailable ? "继续在这个桌面线程里输入..." : "当前线程仅支持监督查看")
+                        Text(state.bridgeReplyAvailable ? "继续在这个 Codex 线程里输入..." : "当前线程仅支持监督查看")
                             .font(.system(size: 16, weight: .regular))
                             .foregroundStyle(CodexPalette.subtleText)
                             .padding(.horizontal, 18)
@@ -597,10 +597,10 @@ private struct MonitorWorkspaceDetailView: View {
 
     private var bridgeReplyHint: String {
         if state.isRunning {
-            return "正在监督这条桌面线程的运行状态"
+            return "正在监督这条 Codex 线程的运行状态"
         }
         if state.bridgeReplyAvailable {
-            return "回复会继续写入同一个桌面线程，可切换模型、权限并附加图片或文件"
+            return "回复会继续写入同一个 Codex 线程，可切换模型、权限并附加图片或文件"
         }
         return "当前线程只支持监督，不允许从移动端回写"
     }
@@ -1230,7 +1230,7 @@ private struct MonitorPageView: View {
                         .fixedSize(horizontal: false, vertical: true)
 
                     HStack(spacing: 8) {
-                        DetailBadge(text: state.bridgeReplyAvailable ? "Desktop" : state.currentSourceKind.uppercased(), style: .neutral)
+                        DetailBadge(text: state.bridgeReplyAvailable ? "Direct" : state.currentSourceKind.uppercased(), style: .neutral)
                         DetailBadge(text: state.isRunning ? "Running" : "Monitoring", style: state.isRunning ? .connected : .neutral)
                         DetailBadge(text: state.currentSourceKind.uppercased(), style: .neutral)
                         if let agentNickname = state.currentAgentNickname, !agentNickname.isEmpty {
@@ -1365,9 +1365,9 @@ private struct MonitorPageView: View {
 
     private var bridgeReplyHint: String {
         if state.bridgeReplyAvailable {
-            return "Replies resume the same desktop thread on your Mac, not a separate CLI-only session."
+            return "Replies resume the same Codex thread on your Mac, not a separate bridge-only session."
         }
-        return "This view is supervising a real desktop thread. Reply is disabled for the current connection state."
+        return "This view is supervising a real Codex thread. Reply is disabled for the current connection state."
     }
 }
 
@@ -1548,7 +1548,10 @@ private struct SessionRowView: View {
                         .lineLimit(2)
 
                     HStack(spacing: 8) {
-                        DetailBadge(text: session.desktopThread ? "Desktop" : (session.sourceKind ?? session.source).uppercased(), style: .neutral)
+                        DetailBadge(
+                            text: session.bridgeReplyAvailable ? "Direct" : (session.sourceKind ?? session.source).uppercased(),
+                            style: .neutral
+                        )
                         if session.sourceKind == "subagent" {
                             DetailBadge(
                                 text: session.agentRole?.isEmpty == false ? (session.agentRole ?? "SubAgent") : "SubAgent",
@@ -1919,6 +1922,12 @@ private struct BoardTaskCardView: View {
                         DetailBadge(text: "\(runtime.subagentCount) SubAgents", style: .warning)
                     }
                 }
+                if let context = boardRuntimeContext(runtime) {
+                    Text(context)
+                        .font(.system(size: 11, weight: .regular))
+                        .foregroundStyle(CodexPalette.subtleText)
+                        .lineLimit(2)
+                }
             }
 
             if let branches = task.branches {
@@ -2013,6 +2022,13 @@ private struct BoardThreadCardView: View {
                     .lineLimit(3)
             }
 
+            if let runtime = thread.runtime, let context = boardRuntimeContext(runtime) {
+                Text(context)
+                    .font(.system(size: 11, weight: .regular))
+                    .foregroundStyle(CodexPalette.subtleText)
+                    .lineLimit(2)
+            }
+
             HStack(spacing: 12) {
                 if let lastInvocation = thread.lastInvocation {
                     Text(lastInvocation.elapsedText)
@@ -2058,6 +2074,25 @@ private func boardLogStyle(_ kind: String) -> DetailBadge.Style {
     default:
         return .neutral
     }
+}
+
+private func boardRuntimeContext(_ runtime: BoardRuntimeSnapshot) -> String? {
+    let actor = runtime.agentNickname ?? runtime.latestTitle
+    let controller = runtime.controllerTitle
+
+    if runtime.sourceKind == "subagent" {
+        if let actor, !actor.isEmpty, let controller, !controller.isEmpty {
+            return runtime.controllerRunning == true ? "\(actor) via live desktop thread" : "\(actor) via desktop thread"
+        }
+        if let actor, !actor.isEmpty {
+            return actor
+        }
+    }
+
+    if let controller, !controller.isEmpty {
+        return runtime.controllerRunning == true ? "Desktop thread live" : "Desktop thread"
+    }
+    return nil
 }
 
 private struct BoardMiniStat: View {

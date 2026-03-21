@@ -428,6 +428,9 @@ struct BoardRuntimeSnapshot: Decodable, Hashable {
     let sourceKind: String?
     let agentNickname: String?
     let agentRole: String?
+    let controllerTitle: String?
+    let controllerSourceKind: String?
+    let controllerRunning: Bool?
 
     private enum CodingKeys: String, CodingKey {
         case sessionCount = "session_count"
@@ -442,6 +445,9 @@ struct BoardRuntimeSnapshot: Decodable, Hashable {
         case sourceKind = "source_kind"
         case agentNickname = "agent_nickname"
         case agentRole = "agent_role"
+        case controllerTitle = "controller_title"
+        case controllerSourceKind = "controller_source_kind"
+        case controllerRunning = "controller_running"
     }
 }
 

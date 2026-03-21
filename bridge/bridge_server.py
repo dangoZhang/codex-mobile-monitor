@@ -305,6 +305,12 @@ def is_desktop_reply_source(source_kind: str) -> bool:
     return source_kind in {"vscode", "app", "bridge"}
 
 
+def is_bridge_reply_source(source_kind: str, parent_thread_id: str | None = None) -> bool:
+    if parent_thread_id:
+        return False
+    return source_kind in {"vscode", "app", "bridge", "exec"}
+
+
 def sanitize_filename(value: str, fallback: str) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", value.strip()).strip("-.")
     return cleaned or fallback
@@ -1187,6 +1193,46 @@ def match_thread_identity(session: dict[str, Any], thread_def: dict[str, Any]) -
     return best
 
 
+def session_updated_at_value(session: dict[str, Any]) -> float:
+    updated_at = parse_iso_datetime(str(session.get("updated_at") or ""))
+    return updated_at.timestamp() if updated_at else 0.0
+
+
+def session_source_priority(session: dict[str, Any]) -> int:
+    source_kind = str(session.get("source_kind") or "")
+    if is_desktop_reply_source(source_kind):
+        return 4
+    if source_kind == "subagent":
+        return 3
+    if source_kind == "exec":
+        return 2
+    return 1
+
+
+def session_is_desktop_like(session: dict[str, Any]) -> bool:
+    if bool(session.get("desktop_thread")):
+        return True
+    return is_desktop_reply_source(str(session.get("source_kind") or ""))
+
+
+def group_runtime_priority(items: list[dict[str, Any]]) -> tuple[int, float, int, int]:
+    return (
+        1 if any(bool(item.get("running")) for item in items) else 0,
+        max(session_updated_at_value(item) for item in items),
+        max(session_source_priority(item) for item in items),
+        len(items),
+    )
+
+
+def representative_session_priority(session: dict[str, Any]) -> tuple[int, int, int, float]:
+    return (
+        1 if bool(session.get("running")) else 0,
+        1 if session_is_desktop_like(session) else 0,
+        session_source_priority(session),
+        session_updated_at_value(session),
+    )
+
+
 def build_board_runtime_index(
     board_root: Path,
     target_repo_root: str | None,
@@ -1207,6 +1253,11 @@ def build_board_runtime_index(
         str(row.get("id") or ""): row
         for row in thread_defs
         if str(row.get("id") or "")
+    }
+    session_index = {
+        str(session.get("id") or ""): session
+        for session in session_summaries
+        if str(session.get("id") or "")
     }
     grouped: dict[str, dict[str, list[dict[str, Any]]]] = {thread_id: {} for thread_id in thread_ids}
 
@@ -1254,21 +1305,32 @@ def build_board_runtime_index(
 
         selected_group = max(
             groups.values(),
-            key=lambda items: max(str(item.get("updated_at") or "") for item in items),
+            key=group_runtime_priority,
         )
-        selected_group = sorted(selected_group, key=lambda item: str(item.get("updated_at") or ""), reverse=True)
-        latest = selected_group[0]
+        representative = max(selected_group, key=representative_session_priority)
+        controller = session_index.get(str(representative.get("parent_thread_id") or ""))
         runtime[thread_id] = {
             "session_count": len(selected_group),
             "subagent_count": sum(1 for item in selected_group if item.get("source_kind") == "subagent"),
             "running": any(bool(item.get("running")) for item in selected_group),
-            "updated_at": latest.get("updated_at"),
-            "git_branch": latest.get("git_branch"),
-            "latest_title": latest.get("title"),
-            "last_message_preview": latest.get("last_message_preview"),
-            "source_kind": latest.get("source_kind"),
-            "agent_nickname": latest.get("agent_nickname"),
-            "agent_role": latest.get("agent_role"),
+            "updated_at": representative.get("updated_at"),
+            "git_branch": representative.get("git_branch"),
+            "latest_title": representative.get("title"),
+            "last_message_preview": representative.get("last_message_preview"),
+            "source_kind": representative.get("source_kind"),
+            "agent_nickname": representative.get("agent_nickname"),
+            "agent_role": representative.get("agent_role"),
+            "controller_title": controller.get("title") if isinstance(controller, dict) else None,
+            "controller_source_kind": (
+                controller.get("source_kind")
+                if isinstance(controller, dict)
+                else None
+            ),
+            "controller_running": (
+                bool(controller.get("running"))
+                if isinstance(controller, dict)
+                else None
+            ),
         }
 
     return runtime
@@ -1411,13 +1473,14 @@ def annotate_runtime_snapshot(
     latest_log_dt = parse_board_log_timestamp(str((latest_log or {}).get("timestamp") or ""))
     stale = False
     stale_reason: str | None = None
+    is_live = bool(runtime.get("running")) or bool(runtime.get("controller_running"))
 
-    if updated_at and latest_log_dt:
+    if updated_at and latest_log_dt and not is_live:
         delta_seconds = (latest_log_dt - updated_at.astimezone(timezone.utc)).total_seconds()
         if delta_seconds > 12 * 3600:
             stale = True
             stale_reason = "log_newer"
-    elif updated_at and not bool(runtime.get("running")):
+    elif updated_at and not is_live:
         age = datetime.now(timezone.utc) - updated_at.astimezone(timezone.utc)
         if age.total_seconds() > 72 * 3600:
             stale = True
@@ -1975,7 +2038,7 @@ class SessionStore:
                 source_depth=record.source_depth,
                 agent_nickname=record.agent_nickname,
                 agent_role=record.agent_role,
-                bridge_reply_available=is_desktop_reply_source(record.source_kind),
+                bridge_reply_available=is_bridge_reply_source(record.source_kind, record.parent_thread_id),
             )
             self.sessions[record.thread_id] = session
 
@@ -2016,7 +2079,7 @@ class SessionStore:
             session.source_depth = record.source_depth
             session.agent_nickname = record.agent_nickname
             session.agent_role = record.agent_role
-            session.bridge_reply_available = is_desktop_reply_source(record.source_kind)
+            session.bridge_reply_available = is_bridge_reply_source(record.source_kind, record.parent_thread_id)
             if not session.messages and record.first_user_message and session.title.startswith("Thread "):
                 session.title = record.first_user_message.splitlines()[0][:48]
             metadata_changed = previous_summary != (
@@ -2100,6 +2163,11 @@ class SessionStore:
                 session.agent_nickname = delta.agent_nickname
             if delta.agent_role:
                 session.agent_role = delta.agent_role
+            session.desktop_thread = is_desktop_reply_source(session.source_kind)
+            session.bridge_reply_available = is_bridge_reply_source(
+                session.source_kind,
+                session.parent_thread_id,
+            )
 
             new_messages: list[ChatMessage] = []
             for message in delta.messages:
@@ -2309,8 +2377,8 @@ async def handle_send_message(request: web.Request) -> web.Response:
         return json_response({"error": "text or attachments are required"}, status=400)
     if not cwd.exists():
         return json_response({"error": f"cwd not found: {cwd}"}, status=400)
-    if session.imported and not session.desktop_thread:
-        return json_response({"error": "reply is only enabled for desktop threads"}, status=400)
+    if session.imported and not session.bridge_reply_available:
+        return json_response({"error": "reply is only enabled for top-level Codex threads"}, status=400)
 
     attachments = save_mobile_uploads(attachment_fields, cwd, session.id) if attachment_fields else []
     image_paths = [Path(item["path"]) for item in attachments if item["is_image"]]

@@ -26,7 +26,7 @@ final class AppState: ObservableObject {
     @Published var isRunning = false
     @Published var lastOutputLine: String?
     @Published var errorMessage: String?
-    @Published var title: String = "Desktop Threads"
+    @Published var title: String = "Codex Threads"
     @Published var currentCWD: String?
     @Published var currentProjectRoot: String?
     @Published var currentProjectName: String?
@@ -117,7 +117,7 @@ final class AppState: ObservableObject {
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty || !draftAttachments.isEmpty else { return }
         guard let sessionID = selectedSessionID else {
-            errorMessage = "先选择一个桌面线程"
+            errorMessage = "先选择一个 Codex 线程"
             return
         }
         guard let baseURL else { return }

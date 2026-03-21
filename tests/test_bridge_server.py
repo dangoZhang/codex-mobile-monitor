@@ -11,6 +11,7 @@ from pathlib import Path
 from bridge.bridge_server import (
     ChatSession,
     SessionStore,
+    ThreadRecord,
     annotate_runtime_snapshot,
     build_board_runtime_index,
     create_app,
@@ -643,6 +644,17 @@ class BridgeServerTests(unittest.TestCase):
                     "last_message_preview": "benchmark case",
                 },
                 {
+                    "id": "parent-live",
+                    "title": "Desktop coordination thread",
+                    "cwd": str(target_repo),
+                    "git_branch": "master",
+                    "updated_at": "2026-03-21T01:04:00.000Z",
+                    "source_kind": "vscode",
+                    "desktop_thread": True,
+                    "running": True,
+                    "last_message_preview": "coordinating workers",
+                },
+                {
                     "id": "thread6-live",
                     "title": "You are thread6.",
                     "first_user_message": "H-T1-T6-AUTO submitted for thread1 commit abc123.",
@@ -652,6 +664,34 @@ class BridgeServerTests(unittest.TestCase):
                     "source_kind": "vscode",
                     "running": False,
                     "last_message_preview": "auto dispatch",
+                },
+                {
+                    "id": "thread1-worker",
+                    "title": "Franklin (worker)",
+                    "first_user_message": "You are acting as thread1 / 01-Backbone in the coordination workspace.",
+                    "cwd": str(target_repo),
+                    "git_branch": None,
+                    "updated_at": "2026-03-21T01:02:30.000Z",
+                    "source_kind": "subagent",
+                    "parent_thread_id": "parent-live",
+                    "agent_nickname": "Franklin",
+                    "agent_role": "worker",
+                    "running": False,
+                    "last_message_preview": "finished focused review",
+                },
+                {
+                    "id": "thread1-worker-live",
+                    "title": "Godel (worker)",
+                    "first_user_message": "You are acting as thread1 / 01-Backbone in the coordination workspace.",
+                    "cwd": str(target_repo),
+                    "git_branch": None,
+                    "updated_at": "2026-03-21T01:02:00.000Z",
+                    "source_kind": "subagent",
+                    "parent_thread_id": "parent-live",
+                    "agent_nickname": "Godel",
+                    "agent_role": "worker",
+                    "running": True,
+                    "last_message_preview": "still running backend checks",
                 },
             ]
 
@@ -663,7 +703,10 @@ class BridgeServerTests(unittest.TestCase):
                 sessions,
             )
 
-            self.assertEqual(runtime["thread1"]["latest_title"], "Backend coding")
+            self.assertEqual(runtime["thread1"]["latest_title"], "Godel (worker)")
+            self.assertEqual(runtime["thread1"]["controller_title"], "Desktop coordination thread")
+            self.assertEqual(runtime["thread1"]["controller_source_kind"], "vscode")
+            self.assertTrue(runtime["thread1"]["controller_running"])
             self.assertEqual(runtime["thread3"]["latest_title"], "You are acting as 03-Review for this repository.")
             self.assertEqual(runtime["thread4"]["latest_title"], "You are acting as thread4 / 04-Test")
             self.assertEqual(runtime["thread6"]["latest_title"], "You are thread6.")
@@ -720,6 +763,66 @@ class BridgeServerTests(unittest.TestCase):
 
             self.assertEqual(set(runtime.keys()), {"thread3"})
             self.assertEqual(runtime["thread3"]["latest_title"], "Hilbert (worker)")
+
+    def test_build_board_runtime_index_prefers_running_group_over_newer_finished_group(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            board_root = root / "codex_coordination"
+            target_repo = root / "demo"
+            board_root.mkdir()
+            target_repo.mkdir()
+
+            thread_defs = [
+                {"id": "thread1", "slot": "01", "name": "01-Backbone", "role": "Backend"},
+            ]
+            sessions = [
+                {
+                    "id": "thread1-old-live",
+                    "title": "Active worker",
+                    "first_user_message": "You are acting as thread1 / 01-Backbone in the coordination workspace.",
+                    "cwd": str(target_repo),
+                    "git_branch": None,
+                    "updated_at": "2026-03-21T01:00:00.000Z",
+                    "source_kind": "subagent",
+                    "running": True,
+                    "last_message_preview": "still active",
+                    "parent_thread_id": "parent-thread",
+                },
+                {
+                    "id": "thread1-newer-finished",
+                    "title": "Finished worker",
+                    "first_user_message": "You are acting as thread1 / 01-Backbone in the coordination workspace.",
+                    "cwd": str(target_repo),
+                    "git_branch": None,
+                    "updated_at": "2026-03-21T02:00:00.000Z",
+                    "source_kind": "subagent",
+                    "running": False,
+                    "last_message_preview": "done",
+                },
+                {
+                    "id": "parent-thread",
+                    "title": "Desktop controller",
+                    "cwd": str(target_repo),
+                    "git_branch": "master",
+                    "updated_at": "2026-03-21T02:05:00.000Z",
+                    "source_kind": "vscode",
+                    "desktop_thread": True,
+                    "running": True,
+                    "last_message_preview": "controlling",
+                },
+            ]
+
+            runtime = build_board_runtime_index(
+                board_root,
+                str(target_repo),
+                None,
+                thread_defs,
+                sessions,
+            )
+
+            self.assertEqual(runtime["thread1"]["latest_title"], "Active worker")
+            self.assertTrue(runtime["thread1"]["running"])
+            self.assertEqual(runtime["thread1"]["controller_title"], "Desktop controller")
 
     def test_list_board_runtime_sessions_filters_live_sessions_outside_board_scope(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -823,6 +926,53 @@ class BridgeServerTests(unittest.TestCase):
 
             self.assertEqual([item["id"] for item in sessions], ["thread1-root"])
 
+    def test_upsert_exec_thread_is_replyable_without_marking_desktop_thread(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            rollout_path = root / "exec-thread.jsonl"
+            rollout_path.write_text("", encoding="utf-8")
+
+            store = SessionStore(
+                workspace=root,
+                codex_home=root,
+                codex_command=("codex",),
+                codex_version="codex-cli test",
+                threads_db_path=root / "state.sqlite",
+                scan_limit=60,
+                poll_interval=1.0,
+                allowed_sources={"exec", "vscode"},
+                board_folders=(root,),
+                board_roots=(),
+            )
+
+            record = ThreadRecord(
+                thread_id="exec-thread",
+                title="Reply with exactly: OK",
+                source="exec",
+                source_kind="exec",
+                git_branch=None,
+                cwd=str(root),
+                created_at="2026-03-21T01:00:00.000Z",
+                updated_at="2026-03-21T01:00:01.000Z",
+                rollout_path=str(rollout_path),
+                model_provider="openai_http",
+                cli_version="0.200.0",
+                first_user_message="Reply with exactly: OK",
+                parent_thread_id=None,
+                source_depth=None,
+                agent_nickname=None,
+                agent_role=None,
+            )
+
+            asyncio.run(store._upsert_thread_record(record))
+
+            session = asyncio.run(store.get_session("exec-thread"))
+
+            self.assertIsNotNone(session)
+            assert session is not None
+            self.assertFalse(session.desktop_thread)
+            self.assertTrue(session.bridge_reply_available)
+
     def test_read_board_snapshot_only_marks_runtime_on_selected_task(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
@@ -897,6 +1047,27 @@ class BridgeServerTests(unittest.TestCase):
         self.assertIsNotNone(annotated)
         self.assertTrue(annotated["stale"])
         self.assertEqual(annotated["stale_reason"], "log_newer")
+
+    def test_annotate_runtime_snapshot_keeps_live_controller_from_going_stale(self) -> None:
+        runtime = {
+            "session_count": 2,
+            "subagent_count": 1,
+            "running": False,
+            "controller_running": True,
+            "updated_at": "2026-03-18T01:00:00.000Z",
+        }
+        latest_log = {
+            "timestamp": "2026-03-19 09:00",
+            "type": "update",
+            "message": "newer board event",
+            "line_no": 12,
+        }
+
+        annotated = annotate_runtime_snapshot(runtime, latest_log)
+
+        self.assertIsNotNone(annotated)
+        self.assertFalse(annotated["stale"])
+        self.assertIsNone(annotated["stale_reason"])
 
     def test_annotate_runtime_snapshot_tolerates_same_day_timezone_offset(self) -> None:
         runtime = {
