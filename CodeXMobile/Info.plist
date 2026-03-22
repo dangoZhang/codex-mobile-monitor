@@ -29,6 +29,8 @@
 	</dict>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Connect to the CodeX bridge running on your Mac.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>Select images from your iPhone or iPad and send them to the current CodeX desktop thread.</string>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
 	<key>UILaunchScreen</key>

@@ -16,3 +16,4 @@ codex-coordination-kit/
 scripts/
 package.json
 dist/
+.codex-mobile-uploads/
