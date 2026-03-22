@@ -21,6 +21,11 @@ from typing import Any
 
 from aiohttp import web
 
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover
+    import tomli as tomllib
+
 
 BOARD_STATUS_ORDER = ("BLOCKED", "IN_PROGRESS", "TODO", "DONE")
 BOARD_STATUS_TITLES = {
@@ -528,6 +533,7 @@ class ThreadRecord:
     source_depth: int | None
     agent_nickname: str | None
     agent_role: str | None
+    model: str | None = None
 
 
 @dataclass
@@ -553,6 +559,7 @@ class ParsedFileDelta:
     stat_mtime_ns: int
     reset_applied: bool
     tool_call_names: dict[str, str]
+    model: str | None = None
 
 
 @dataclass
@@ -585,6 +592,7 @@ class ChatSession:
     desktop_thread: bool = False
     data_source: str = "bridge"
     rollout_path: str | None = None
+    model: str | None = None
     model_provider: str | None = None
     cli_version: str | None = None
     first_user_message: str | None = None
@@ -627,6 +635,7 @@ class ChatSession:
             "desktop_thread": self.desktop_thread,
             "data_source": self.data_source,
             "rollout_path": self.rollout_path,
+            "model": self.model,
             "model_provider": self.model_provider,
             "cli_version": self.cli_version,
             "first_user_message": self.first_user_message,
@@ -649,6 +658,30 @@ class ChatSession:
 
 
 def read_threads_from_sqlite(db_path: Path, limit: int, allowed_sources: set[str]) -> list[ThreadRecord]:
+    def row_to_record(row: sqlite3.Row) -> ThreadRecord:
+        source_meta = parse_source_metadata(row["source"])
+        thread_id = str(row["id"])
+        base_title = str(row["title"] or row["first_user_message"] or f"Thread {thread_id[:8]}")
+        return ThreadRecord(
+            thread_id=thread_id,
+            title=decorate_thread_title(base_title, source_meta),
+            source=source_meta.raw_text,
+            source_kind=source_meta.kind,
+            git_branch=str(row["git_branch"]) if row["git_branch"] else None,
+            cwd=str(row["cwd"] or ""),
+            created_at=unix_to_iso(row["created_at"]),
+            updated_at=unix_to_iso(row["updated_at"]),
+            rollout_path=str(row["rollout_path"] or ""),
+            model=str(row["model"]) if row["model"] else None,
+            model_provider=str(row["model_provider"]) if row["model_provider"] else None,
+            cli_version=str(row["cli_version"]) if row["cli_version"] else None,
+            first_user_message=str(row["first_user_message"]) if row["first_user_message"] else None,
+            parent_thread_id=source_meta.parent_thread_id,
+            source_depth=source_meta.depth,
+            agent_nickname=str(row["agent_nickname"]) if row["agent_nickname"] else source_meta.agent_nickname,
+            agent_role=str(row["agent_role"]) if row["agent_role"] else source_meta.agent_role,
+        )
+
     uri = f"file:{db_path}?mode=ro"
     connection = sqlite3.connect(uri, uri=True)
     connection.row_factory = sqlite3.Row
@@ -656,7 +689,7 @@ def read_threads_from_sqlite(db_path: Path, limit: int, allowed_sources: set[str
         cursor = connection.cursor()
         cursor.execute(
             """
-            SELECT id, title, source, cwd, created_at, updated_at, rollout_path, model_provider, cli_version, first_user_message, agent_nickname, agent_role, git_branch
+            SELECT id, title, source, cwd, created_at, updated_at, rollout_path, model, model_provider, cli_version, first_user_message, agent_nickname, agent_role, git_branch
             FROM threads
             WHERE archived = 0
             ORDER BY updated_at DESC
@@ -666,6 +699,7 @@ def read_threads_from_sqlite(db_path: Path, limit: int, allowed_sources: set[str
         )
         records: list[ThreadRecord] = []
         seen_ids: set[str] = set()
+        pending_parent_ids: list[str] = []
         for row in cursor.fetchall():
             source_meta = parse_source_metadata(row["source"])
             if allowed_sources and source_meta.kind not in allowed_sources and source_meta.raw_text not in allowed_sources:
@@ -674,29 +708,31 @@ def read_threads_from_sqlite(db_path: Path, limit: int, allowed_sources: set[str
             if thread_id in seen_ids:
                 continue
             seen_ids.add(thread_id)
-            base_title = str(row["title"] or row["first_user_message"] or f"Thread {thread_id[:8]}")
-            records.append(
-                ThreadRecord(
-                    thread_id=thread_id,
-                    title=decorate_thread_title(base_title, source_meta),
-                    source=source_meta.raw_text,
-                    source_kind=source_meta.kind,
-                    git_branch=str(row["git_branch"]) if row["git_branch"] else None,
-                    cwd=str(row["cwd"] or ""),
-                    created_at=unix_to_iso(row["created_at"]),
-                    updated_at=unix_to_iso(row["updated_at"]),
-                    rollout_path=str(row["rollout_path"] or ""),
-                    model_provider=str(row["model_provider"]) if row["model_provider"] else None,
-                    cli_version=str(row["cli_version"]) if row["cli_version"] else None,
-                    first_user_message=str(row["first_user_message"]) if row["first_user_message"] else None,
-                    parent_thread_id=source_meta.parent_thread_id,
-                    source_depth=source_meta.depth,
-                    agent_nickname=str(row["agent_nickname"]) if row["agent_nickname"] else source_meta.agent_nickname,
-                    agent_role=str(row["agent_role"]) if row["agent_role"] else source_meta.agent_role,
-                )
-            )
+            records.append(row_to_record(row))
+            if source_meta.parent_thread_id and source_meta.parent_thread_id not in seen_ids:
+                pending_parent_ids.append(source_meta.parent_thread_id)
             if len(records) >= limit:
                 break
+
+        unique_parent_ids = [parent_id for parent_id in dict.fromkeys(pending_parent_ids) if parent_id not in seen_ids]
+        if unique_parent_ids:
+            placeholders = ",".join("?" for _ in unique_parent_ids)
+            cursor.execute(
+                f"""
+                SELECT id, title, source, cwd, created_at, updated_at, rollout_path, model, model_provider, cli_version, first_user_message, agent_nickname, agent_role, git_branch
+                FROM threads
+                WHERE archived = 0
+                  AND id IN ({placeholders})
+                """,
+                tuple(unique_parent_ids),
+            )
+            for row in cursor.fetchall():
+                thread_id = str(row["id"])
+                if thread_id in seen_ids:
+                    continue
+                seen_ids.add(thread_id)
+                records.append(row_to_record(row))
+
         return records
     finally:
         connection.close()
@@ -738,6 +774,65 @@ def read_recent_projects_from_sqlite(db_path: Path, limit: int) -> list[dict[str
         return projects
     finally:
         connection.close()
+
+
+def read_recent_models_from_sqlite(db_path: Path, limit: int) -> list[str]:
+    uri = f"file:{db_path}?mode=ro"
+    connection = sqlite3.connect(uri, uri=True)
+    connection.row_factory = sqlite3.Row
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            SELECT model
+            FROM threads
+            WHERE archived = 0
+              AND model IS NOT NULL
+              AND model != ''
+            ORDER BY updated_at DESC
+            LIMIT ?
+            """,
+            (max(limit * 4, 20),),
+        )
+        models: list[str] = []
+        seen: set[str] = set()
+        for row in cursor.fetchall():
+            model = str(row["model"] or "").strip()
+            if not model or model in seen:
+                continue
+            seen.add(model)
+            models.append(model)
+        return models
+    finally:
+        connection.close()
+
+
+def read_configured_codex_model(codex_home: Path) -> str | None:
+    config_path = codex_home / "config.toml"
+    if not config_path.exists():
+        return None
+    try:
+        payload = tomllib.loads(config_path.read_text("utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return None
+
+    model = payload.get("model")
+    if not isinstance(model, str):
+        return None
+    cleaned = model.strip()
+    return cleaned or None
+
+
+def merge_model_catalog(configured_model: str | None, recent_models: list[str]) -> list[str]:
+    catalog: list[str] = []
+    seen: set[str] = set()
+    for candidate in [configured_model, *recent_models]:
+        cleaned = str(candidate or "").strip()
+        if not cleaned or cleaned in seen:
+            continue
+        seen.add(cleaned)
+        catalog.append(cleaned)
+    return catalog
 
 
 def read_board_runtime_sessions_from_sqlite(
@@ -1282,6 +1377,130 @@ def representative_session_priority(session: dict[str, Any]) -> tuple[int, int, 
     )
 
 
+def visible_session_root_id(session: dict[str, Any], session_index: dict[str, dict[str, Any]]) -> str:
+    session_id = str(session.get("id") or "").strip()
+    if not session_id:
+        return ""
+
+    if str(session.get("source_kind") or "") != "subagent":
+        return session_id
+
+    parent_id = str(session.get("parent_thread_id") or "").strip()
+    if not parent_id:
+        return session_id
+
+    seen = {session_id}
+    root_id = session_id
+    current_parent_id = parent_id
+    while current_parent_id and current_parent_id not in seen:
+        parent = session_index.get(current_parent_id)
+        if not isinstance(parent, dict):
+            break
+        root_id = current_parent_id
+        seen.add(current_parent_id)
+        if str(parent.get("source_kind") or "") != "subagent":
+            return root_id
+        current_parent_id = str(parent.get("parent_thread_id") or "").strip()
+    return root_id
+
+
+def collapse_session_summaries(session_summaries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    session_index = {
+        str(session.get("id") or ""): session
+        for session in session_summaries
+        if str(session.get("id") or "")
+    }
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for session in session_summaries:
+        root_id = visible_session_root_id(session, session_index)
+        if not root_id:
+            continue
+        grouped.setdefault(root_id, []).append(session)
+
+    collapsed: list[dict[str, Any]] = []
+    for root_id, group in grouped.items():
+        root = session_index.get(root_id)
+        if not isinstance(root, dict):
+            root = max(group, key=representative_session_priority)
+        activity = latest_group_activity_session(group)
+        summary = dict(root)
+        summary["updated_at"] = activity.get("updated_at") or root.get("updated_at")
+        summary["running"] = any(bool(item.get("running")) for item in group)
+        summary["last_message_preview"] = (
+            activity.get("last_message_preview")
+            or root.get("last_message_preview")
+            or ""
+        )
+        summary["session_count"] = len(group)
+        summary["subagent_count"] = sum(1 for item in group if item.get("source_kind") == "subagent")
+        summary["latest_title"] = activity.get("title")
+        summary["latest_session_id"] = activity.get("id")
+        collapsed.append(summary)
+
+    collapsed.sort(
+        key=lambda item: (
+            1 if session_is_desktop_like(item) else 0,
+            session_updated_at_value(item),
+        ),
+        reverse=True,
+    )
+    return collapsed
+
+
+def latest_group_activity_session(group: list[dict[str, Any]]) -> dict[str, Any]:
+    return max(
+        group,
+        key=lambda item: (
+            session_updated_at_value(item),
+            1 if bool(item.get("running")) else 0,
+            session_source_priority(item),
+        ),
+    )
+
+
+def collapse_session_details(
+    session_id: str,
+    session_summaries: list[dict[str, Any]],
+    session_detail: dict[str, Any],
+) -> dict[str, Any]:
+    session_index = {
+        str(session.get("id") or ""): session
+        for session in session_summaries
+        if str(session.get("id") or "")
+    }
+    target = session_index.get(session_id)
+    if not isinstance(target, dict):
+        return session_detail
+
+    root_id = visible_session_root_id(target, session_index)
+    if not root_id:
+        return session_detail
+
+    group = [
+        session
+        for session in session_summaries
+        if visible_session_root_id(session, session_index) == root_id
+    ]
+    if not group:
+        return session_detail
+
+    activity = latest_group_activity_session(group)
+    return {
+        **session_detail,
+        "updated_at": activity.get("updated_at") or session_detail.get("updated_at"),
+        "running": any(bool(item.get("running")) for item in group),
+        "last_message_preview": (
+            activity.get("last_message_preview")
+            or session_detail.get("last_message_preview")
+            or ""
+        ),
+        "session_count": len(group),
+        "subagent_count": sum(1 for item in group if item.get("source_kind") == "subagent"),
+        "latest_title": activity.get("title"),
+        "latest_session_id": activity.get("id"),
+    }
+
+
 def build_board_runtime_index(
     board_root: Path,
     target_repo_root: str | None,
@@ -1719,6 +1938,7 @@ def parse_rollout_delta(
     source: str | None = None
     source_kind: str | None = None
     originator: str | None = None
+    model: str | None = None
     model_provider: str | None = None
     cli_version: str | None = None
     parent_thread_id: str | None = None
@@ -1768,6 +1988,8 @@ def parse_rollout_delta(
                     agent_role = str(meta["agent_role"])
                 elif source_meta.agent_role:
                     agent_role = source_meta.agent_role
+                if isinstance(meta.get("model"), str):
+                    model = str(meta["model"])
                 if isinstance(meta.get("model_provider"), str):
                     model_provider = str(meta["model_provider"])
                 if isinstance(meta.get("cli_version"), str):
@@ -1886,6 +2108,7 @@ def parse_rollout_delta(
         source=source,
         source_kind=source_kind,
         originator=originator,
+        model=model,
         model_provider=model_provider,
         cli_version=cli_version,
         parent_thread_id=parent_thread_id,
@@ -1928,9 +2151,17 @@ class SessionStore:
         self.board_folders = board_folders
         self.board_roots = board_roots
         self.sessions: dict[str, ChatSession] = {}
-        self.lock = asyncio.Lock()
-        self.sync_lock = asyncio.Lock()
+        self.lock: asyncio.Lock | None = None
+        self.sync_lock: asyncio.Lock | None = None
         self.watch_task: asyncio.Task[None] | None = None
+        self.configured_model: str | None = None
+        self.available_models: tuple[str, ...] = ()
+
+    def _ensure_locks(self) -> None:
+        if self.lock is None:
+            self.lock = asyncio.Lock()
+        if self.sync_lock is None:
+            self.sync_lock = asyncio.Lock()
 
     async def start(self) -> None:
         await self.sync_codex_threads()
@@ -1952,17 +2183,38 @@ class SessionStore:
             await asyncio.sleep(self.poll_interval)
 
     async def get_session(self, session_id: str) -> ChatSession | None:
+        self._ensure_locks()
         async with self.lock:
-            return self.sessions.get(session_id)
+            root_id = self._resolve_visible_session_id(session_id)
+            return self.sessions.get(root_id) if root_id else None
+
+    async def get_session_detail(self, session_id: str) -> dict[str, Any] | None:
+        self._ensure_locks()
+        async with self.lock:
+            root_id = self._resolve_visible_session_id(session_id)
+            if not root_id:
+                return None
+            session = self.sessions.get(root_id)
+            if session is None:
+                return None
+            summaries = [item.summary() for item in self.sessions.values()]
+            return collapse_session_details(root_id, summaries, session.detail())
 
     async def list_sessions(self) -> list[dict[str, Any]]:
+        self._ensure_locks()
         async with self.lock:
-            sessions = sorted(
-                self.sessions.values(),
-                key=lambda item: (item.desktop_thread, item.updated_at),
-                reverse=True,
-            )
-            return [session.summary() for session in sessions]
+            summaries = [session.summary() for session in self.sessions.values()]
+            return collapse_session_summaries(summaries)
+
+    async def list_available_models(self) -> list[str]:
+        self._ensure_locks()
+        async with self.lock:
+            return list(self.available_models)
+
+    async def get_default_model(self) -> str | None:
+        self._ensure_locks()
+        async with self.lock:
+            return self.configured_model
 
     async def list_board_runtime_sessions(self, board_root: Path) -> list[dict[str, Any]]:
         live_sessions = await self.list_sessions()
@@ -2039,6 +2291,7 @@ class SessionStore:
         return serialized
 
     async def add_message(self, session: ChatSession, role: str, text: str, state: str = "done") -> ChatMessage:
+        self._ensure_locks()
         async with self.lock:
             message = ChatMessage(
                 id=str(uuid.uuid4()),
@@ -2054,6 +2307,7 @@ class SessionStore:
             return message
 
     async def publish(self, session: ChatSession, event_type: str, payload: dict[str, Any]) -> SessionEvent:
+        self._ensure_locks()
         async with self.lock:
             event = SessionEvent(
                 seq=session.next_seq,
@@ -2071,12 +2325,14 @@ class SessionStore:
         return event
 
     async def subscribe(self, session: ChatSession) -> asyncio.Queue[SessionEvent]:
+        self._ensure_locks()
         queue: asyncio.Queue[SessionEvent] = asyncio.Queue(maxsize=128)
         async with self.lock:
             session.subscribers.add(queue)
         return queue
 
     async def unsubscribe(self, session: ChatSession, queue: asyncio.Queue[SessionEvent]) -> None:
+        self._ensure_locks()
         async with self.lock:
             session.subscribers.discard(queue)
 
@@ -2084,7 +2340,14 @@ class SessionStore:
         if not self.threads_db_path.exists():
             return
 
+        self._ensure_locks()
         async with self.sync_lock:
+            configured_model = await asyncio.to_thread(read_configured_codex_model, self.codex_home)
+            recent_models = await asyncio.to_thread(read_recent_models_from_sqlite, self.threads_db_path, self.scan_limit)
+            async with self.lock:
+                self.configured_model = configured_model
+                self.available_models = tuple(merge_model_catalog(configured_model, recent_models))
+
             records = await asyncio.to_thread(
                 read_threads_from_sqlite,
                 self.threads_db_path,
@@ -2095,7 +2358,36 @@ class SessionStore:
             for record in records:
                 await self._upsert_thread_record(record)
 
+    def _resolve_visible_session_id(self, session_id: str) -> str | None:
+        cleaned = str(session_id or "").strip()
+        if not cleaned:
+            return None
+        session = self.sessions.get(cleaned)
+        if session is None:
+            return None
+        if session.source_kind != "subagent":
+            return cleaned
+
+        parent_id = str(session.parent_thread_id or "").strip()
+        if not parent_id:
+            return cleaned
+
+        seen = {cleaned}
+        root_id = cleaned
+        current_parent_id = parent_id
+        while current_parent_id and current_parent_id not in seen:
+            parent = self.sessions.get(current_parent_id)
+            if parent is None:
+                break
+            root_id = current_parent_id
+            seen.add(current_parent_id)
+            if parent.source_kind != "subagent":
+                return root_id
+            current_parent_id = str(parent.parent_thread_id or "").strip()
+        return root_id
+
     async def _upsert_thread_record(self, record: ThreadRecord) -> None:
+        self._ensure_locks()
         session: ChatSession
         metadata_changed = False
         async with self.lock:
@@ -2109,6 +2401,7 @@ class SessionStore:
                 desktop_thread=is_desktop_reply_source(record.source_kind),
                 data_source="codex-sqlite+rollout",
                 rollout_path=record.rollout_path,
+                model=record.model,
                 source_kind=record.source_kind,
                 git_branch=record.git_branch,
                 parent_thread_id=record.parent_thread_id,
@@ -2128,6 +2421,7 @@ class SessionStore:
                 session.source_kind,
                 session.git_branch,
                 session.rollout_path,
+                session.model,
                 session.model_provider,
                 session.cli_version,
                 session.first_user_message,
@@ -2149,6 +2443,7 @@ class SessionStore:
             session.desktop_thread = is_desktop_reply_source(record.source_kind)
             session.data_source = "codex-sqlite+rollout"
             session.rollout_path = record.rollout_path
+            session.model = record.model
             session.model_provider = record.model_provider
             session.cli_version = record.cli_version
             session.first_user_message = record.first_user_message
@@ -2168,6 +2463,7 @@ class SessionStore:
                 session.source_kind,
                 session.git_branch,
                 session.rollout_path,
+                session.model,
                 session.model_provider,
                 session.cli_version,
                 session.first_user_message,
@@ -2207,6 +2503,7 @@ class SessionStore:
         await self._apply_rollout_delta(session, delta)
 
     async def _apply_rollout_delta(self, session: ChatSession, delta: ParsedFileDelta) -> None:
+        self._ensure_locks()
         async with self.lock:
             old_running = session.running
             old_message_ids = {message.id for message in session.messages}
@@ -2228,6 +2525,8 @@ class SessionStore:
                 session.source_kind = delta.source_kind
             if delta.originator:
                 session.originator = delta.originator
+            if delta.model:
+                session.model = delta.model
             if delta.model_provider:
                 session.model_provider = delta.model_provider
             if delta.cli_version:
@@ -2412,15 +2711,21 @@ async def handle_root(request: web.Request) -> web.Response:
 
 async def handle_list_sessions(request: web.Request) -> web.Response:
     store: SessionStore = request.app["store"]
-    return json_response({"sessions": await store.list_sessions()})
+    return json_response(
+        {
+            "sessions": await store.list_sessions(),
+            "available_models": await store.list_available_models(),
+            "default_model": await store.get_default_model(),
+        }
+    )
 
 
 async def handle_get_session(request: web.Request) -> web.Response:
     store: SessionStore = request.app["store"]
-    session = await store.get_session(request.match_info["session_id"])
-    if session is None:
+    detail = await store.get_session_detail(request.match_info["session_id"])
+    if detail is None:
         return json_response({"error": "session not found"}, status=404)
-    return json_response(session.detail())
+    return json_response(detail)
 
 
 async def handle_send_message(request: web.Request) -> web.Response:

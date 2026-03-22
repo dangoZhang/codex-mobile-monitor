@@ -14,6 +14,7 @@ from bridge.bridge_server import (
     ThreadRecord,
     annotate_runtime_snapshot,
     build_board_runtime_index,
+    collapse_session_summaries,
     create_app,
     extract_runtime_thread_id,
     open_codex_desktop_thread,
@@ -124,6 +125,7 @@ class BridgeServerTests(unittest.TestCase):
             self.assertEqual(record.agent_nickname, "Euler")
             self.assertEqual(record.agent_role, "worker")
             self.assertEqual(record.title, "Euler (worker)")
+            self.assertEqual(record.model, "gpt-5.4")
 
     def test_parse_rollout_delta_captures_tool_outputs_and_web_search(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -151,6 +153,7 @@ class BridgeServerTests(unittest.TestCase):
                         },
                         "agent_nickname": "Euler",
                         "agent_role": "worker",
+                        "model": "gpt-5.4",
                         "model_provider": "openai_http",
                     },
                 },
@@ -203,6 +206,7 @@ class BridgeServerTests(unittest.TestCase):
             self.assertEqual(delta.parent_thread_id, "parent-thread")
             self.assertEqual(delta.agent_nickname, "Euler")
             self.assertEqual(delta.agent_role, "worker")
+            self.assertEqual(delta.model, "gpt-5.4")
             self.assertEqual([message.tool_name for message in delta.messages], ["wait_agent", "wait_agent", "web_search"])
             self.assertIn("child-thread", delta.messages[0].text)
             self.assertEqual(delta.messages[1].text, '{"completed": "done"}')
@@ -991,6 +995,182 @@ class BridgeServerTests(unittest.TestCase):
             assert session is not None
             self.assertFalse(session.desktop_thread)
             self.assertTrue(session.bridge_reply_available)
+
+    def test_collapse_session_summaries_hides_subagents_under_parent_thread(self) -> None:
+        summaries = [
+            {
+                "id": "parent-thread",
+                "title": "Desktop coordination thread",
+                "created_at": "2026-03-21T01:00:00.000Z",
+                "updated_at": "2026-03-21T01:01:00.000Z",
+                "thread_id": "parent-thread",
+                "cwd": "/tmp/project",
+                "project_root": "/tmp/project",
+                "project_name": "project",
+                "source": "vscode",
+                "source_kind": "vscode",
+                "git_branch": "main",
+                "originator": "Codex Desktop",
+                "imported": True,
+                "desktop_thread": True,
+                "data_source": "codex-sqlite+rollout",
+                "rollout_path": "/tmp/parent.jsonl",
+                "model_provider": "openai_http",
+                "cli_version": "0.200.0",
+                "first_user_message": "main thread",
+                "parent_thread_id": None,
+                "source_depth": None,
+                "agent_nickname": None,
+                "agent_role": None,
+                "bridge_reply_available": True,
+                "running": False,
+                "message_count": 8,
+                "last_message_preview": "controller idle",
+            },
+            {
+                "id": "child-thread",
+                "title": "Godel (worker)",
+                "created_at": "2026-03-21T01:02:00.000Z",
+                "updated_at": "2026-03-21T01:05:00.000Z",
+                "thread_id": "child-thread",
+                "cwd": "/tmp/project",
+                "project_root": "/tmp/project",
+                "project_name": "project",
+                "source": "subagent",
+                "source_kind": "subagent",
+                "git_branch": None,
+                "originator": "Codex Desktop",
+                "imported": True,
+                "desktop_thread": False,
+                "data_source": "codex-sqlite+rollout",
+                "rollout_path": "/tmp/child.jsonl",
+                "model_provider": "openai_http",
+                "cli_version": "0.200.0",
+                "first_user_message": "child thread",
+                "parent_thread_id": "parent-thread",
+                "source_depth": 1,
+                "agent_nickname": "Godel",
+                "agent_role": "worker",
+                "bridge_reply_available": True,
+                "running": True,
+                "message_count": 11,
+                "last_message_preview": "still running backend checks",
+            },
+        ]
+
+        collapsed = collapse_session_summaries(summaries)
+
+        self.assertEqual(len(collapsed), 1)
+        self.assertEqual(collapsed[0]["id"], "parent-thread")
+        self.assertEqual(collapsed[0]["title"], "Desktop coordination thread")
+        self.assertTrue(collapsed[0]["running"])
+        self.assertEqual(collapsed[0]["updated_at"], "2026-03-21T01:05:00.000Z")
+        self.assertEqual(collapsed[0]["last_message_preview"], "still running backend checks")
+        self.assertEqual(collapsed[0]["session_count"], 2)
+        self.assertEqual(collapsed[0]["subagent_count"], 1)
+
+    def test_collapse_session_summaries_keeps_orphan_subagent_visible(self) -> None:
+        summaries = [
+            {
+                "id": "child-thread",
+                "title": "Godel (worker)",
+                "created_at": "2026-03-21T01:02:00.000Z",
+                "updated_at": "2026-03-21T01:05:00.000Z",
+                "thread_id": "child-thread",
+                "cwd": "/tmp/project",
+                "project_root": "/tmp/project",
+                "project_name": "project",
+                "source": "subagent",
+                "source_kind": "subagent",
+                "git_branch": None,
+                "originator": "Codex Desktop",
+                "imported": True,
+                "desktop_thread": False,
+                "data_source": "codex-sqlite+rollout",
+                "rollout_path": "/tmp/child.jsonl",
+                "model_provider": "openai_http",
+                "cli_version": "0.200.0",
+                "first_user_message": "child thread",
+                "parent_thread_id": "missing-parent",
+                "source_depth": 1,
+                "agent_nickname": "Godel",
+                "agent_role": "worker",
+                "bridge_reply_available": True,
+                "running": True,
+                "message_count": 11,
+                "last_message_preview": "still running backend checks",
+            },
+        ]
+
+        collapsed = collapse_session_summaries(summaries)
+
+        self.assertEqual(len(collapsed), 1)
+        self.assertEqual(collapsed[0]["id"], "child-thread")
+        self.assertEqual(collapsed[0]["subagent_count"], 1)
+
+    def test_get_session_resolves_child_thread_to_visible_parent_detail(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            store = SessionStore(
+                workspace=root,
+                codex_home=root,
+                codex_command=("codex",),
+                codex_version="codex-cli test",
+                threads_db_path=root / "state.sqlite",
+                scan_limit=60,
+                poll_interval=1.0,
+                allowed_sources={"app", "subagent"},
+                board_folders=(root,),
+                board_roots=(),
+            )
+
+            parent = ChatSession(
+                id="parent-thread",
+                title="Desktop coordination thread",
+                created_at="2026-03-21T01:00:00.000Z",
+                updated_at="2026-03-21T01:01:00.000Z",
+                thread_id="parent-thread",
+                source="app",
+                source_kind="app",
+                imported=True,
+                desktop_thread=True,
+                bridge_reply_available=True,
+                model="gpt-5.4",
+                messages=[],
+            )
+            child = ChatSession(
+                id="child-thread",
+                title="Euler (worker)",
+                created_at="2026-03-21T01:02:00.000Z",
+                updated_at="2026-03-21T01:05:00.000Z",
+                thread_id="child-thread",
+                source="subagent",
+                source_kind="subagent",
+                imported=True,
+                desktop_thread=False,
+                bridge_reply_available=False,
+                parent_thread_id="parent-thread",
+                agent_nickname="Euler",
+                agent_role="worker",
+                messages=[],
+            )
+            store.sessions = {
+                parent.id: parent,
+                child.id: child,
+            }
+
+            session = asyncio.run(store.get_session("child-thread"))
+            detail = asyncio.run(store.get_session_detail("child-thread"))
+
+            self.assertIsNotNone(session)
+            assert session is not None
+            self.assertEqual(session.id, "parent-thread")
+            self.assertIsNotNone(detail)
+            assert detail is not None
+            self.assertEqual(detail["id"], "parent-thread")
+            self.assertEqual(detail["subagent_count"], 1)
+            self.assertEqual(detail["session_count"], 2)
+            self.assertEqual(detail["latest_session_id"], "child-thread")
 
     def test_read_board_snapshot_only_marks_runtime_on_selected_task(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
