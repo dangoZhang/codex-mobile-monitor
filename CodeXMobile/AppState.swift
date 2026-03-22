@@ -15,6 +15,7 @@ final class AppState: ObservableObject {
     private static let refreshLoopIntervalNanoseconds: UInt64 = 6_000_000_000
 
     @Published var selectedModel = ComposerModelOption.automatic
+    @Published var availableModelOptions = ComposerModelOption.fallbackOptions
     @Published var selectedAccessMode = ComposerAccessMode.workspaceWrite
     @Published var draftAttachments: [DraftAttachment] = []
     @Published var sessions: [SessionSummary] = []
@@ -37,12 +38,18 @@ final class AppState: ObservableObject {
     @Published var currentDataSource: String = "bridge"
     @Published var currentRolloutPath: String?
     @Published var currentGitBranch: String?
+    @Published var currentModel: String?
     @Published var currentModelProvider: String?
+    @Published var currentDefaultModel: String?
     @Published var currentCLIVersion: String?
     @Published var currentParentThreadID: String?
     @Published var currentSourceDepth: Int?
     @Published var currentAgentNickname: String?
     @Published var currentAgentRole: String?
+    @Published var currentSessionCount: Int = 1
+    @Published var currentSubagentCount: Int = 0
+    @Published var currentLatestTitle: String?
+    @Published var currentLatestSessionID: String?
     @Published var bridgeReplyAvailable = false
 
     private let bridge = BridgeClient()
@@ -81,8 +88,14 @@ final class AppState: ObservableObject {
         isLoading = true
         defer { isLoading = false }
         do {
-            let fetched = try await bridge.fetchSessions(baseURL: baseURL)
+            let response = try await bridge.fetchSessions(baseURL: baseURL)
+            let fetched = response.sessions
             sessions = fetched
+            currentDefaultModel = response.defaultModel
+            availableModelOptions = ComposerModelOption.options(
+                from: response.availableModels,
+                selectedRawValue: selectedModel.rawValue
+            )
             if let selectedSessionID, fetched.contains(where: { $0.id == selectedSessionID }) {
                 await loadSession(id: selectedSessionID, reconnect: false)
             } else if selectFirst, let first = fetched.first {
@@ -228,12 +241,17 @@ final class AppState: ObservableObject {
         currentDataSource = detail.dataSource
         currentRolloutPath = detail.rolloutPath
         currentGitBranch = detail.gitBranch
+        currentModel = detail.model
         currentModelProvider = detail.modelProvider
         currentCLIVersion = detail.cliVersion
         currentParentThreadID = detail.parentThreadID
         currentSourceDepth = detail.sourceDepth
         currentAgentNickname = detail.agentNickname
         currentAgentRole = detail.agentRole
+        currentSessionCount = detail.sessionCount ?? 1
+        currentSubagentCount = detail.subagentCount ?? 0
+        currentLatestTitle = detail.latestTitle
+        currentLatestSessionID = detail.latestSessionID
         bridgeReplyAvailable = detail.bridgeReplyAvailable
         messages = detail.messages
         isRunning = detail.running
@@ -330,6 +348,7 @@ final class AppState: ObservableObject {
             desktopThread: detail.desktopThread,
             dataSource: detail.dataSource,
             rolloutPath: detail.rolloutPath,
+            model: detail.model,
             modelProvider: detail.modelProvider,
             cliVersion: detail.cliVersion,
             parentThreadID: detail.parentThreadID,
@@ -339,7 +358,11 @@ final class AppState: ObservableObject {
             bridgeReplyAvailable: detail.bridgeReplyAvailable,
             running: detail.running,
             messageCount: detail.messageCount,
-            lastMessagePreview: detail.lastMessagePreview
+            lastMessagePreview: detail.lastMessagePreview,
+            sessionCount: detail.sessionCount,
+            subagentCount: detail.subagentCount,
+            latestTitle: detail.latestTitle,
+            latestSessionID: detail.latestSessionID
         )
         if let index = sessions.firstIndex(where: { $0.id == summary.id }) {
             sessions[index] = summary

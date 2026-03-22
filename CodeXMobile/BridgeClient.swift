@@ -45,10 +45,10 @@ final class BridgeClient {
         self.encoder = JSONEncoder()
     }
 
-    func fetchSessions(baseURL: URL) async throws -> [SessionSummary] {
+    func fetchSessions(baseURL: URL) async throws -> SessionListResponse {
         let (data, response) = try await session.data(from: baseURL.bridgeEndpoint("api/sessions"))
         try validate(response: response, data: data)
-        return try decoder.decode(SessionListResponse.self, from: data).sessions
+        return try decoder.decode(SessionListResponse.self, from: data)
     }
 
     func fetchSession(baseURL: URL, sessionID: String) async throws -> SessionDetail {

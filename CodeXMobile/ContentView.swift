@@ -523,7 +523,7 @@ private struct MonitorWorkspaceDetailView: View {
                 .disabled(!state.bridgeReplyAvailable || state.isRunning)
 
                 Menu {
-                    ForEach(ComposerModelOption.allCases) { option in
+                    ForEach(state.availableModelOptions) { option in
                         Button {
                             state.updateSelectedModel(option)
                         } label: {
@@ -614,8 +614,12 @@ private struct MonitorWorkspaceDetailView: View {
     }
 
     private var modelSelectionTitle: String {
-        if state.selectedModel == .automatic {
-            return state.currentModelProvider?.uppercased() ?? ComposerModelOption.automatic.title
+        if state.selectedModel.rawValue.isEmpty {
+            let desktopModel = state.currentModel ?? state.currentDefaultModel
+            if let desktopModel, !desktopModel.isEmpty {
+                return ComposerModelOption.displayName(for: desktopModel)
+            }
+            return ComposerModelOption.automatic.title
         }
         return state.selectedModel.title
     }
@@ -1237,7 +1241,12 @@ private struct MonitorPageView: View {
                     HStack(spacing: 8) {
                         DetailBadge(text: state.bridgeReplyAvailable ? "Direct" : state.currentSourceKind.uppercased(), style: .neutral)
                         DetailBadge(text: state.isRunning ? "Running" : "Monitoring", style: state.isRunning ? .connected : .neutral)
-                        DetailBadge(text: state.currentSourceKind.uppercased(), style: .neutral)
+                        if let currentModel = state.currentModel, !currentModel.isEmpty {
+                            DetailBadge(text: ComposerModelOption.displayName(for: currentModel), style: .neutral)
+                        }
+                        if state.currentSubagentCount > 0 {
+                            DetailBadge(text: "\(state.currentSubagentCount) SubAgents", style: .warning)
+                        }
                         if let agentNickname = state.currentAgentNickname, !agentNickname.isEmpty {
                             DetailBadge(text: agentNickname, style: .warning)
                         }
@@ -1265,6 +1274,10 @@ private struct MonitorPageView: View {
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 10) {
                     MetadataPill(title: "Origin", value: state.currentOriginator ?? "Codex Desktop")
+                    MetadataPill(
+                        title: "Model",
+                        value: state.currentModel.map { ComposerModelOption.displayName(for: $0) } ?? "desktop default"
+                    )
                     MetadataPill(title: "Provider", value: state.currentModelProvider ?? "unknown")
                     MetadataPill(title: "CLI", value: state.currentCLIVersion ?? "unknown")
                     MetadataPill(title: "Data", value: state.currentDataSource)
@@ -1284,6 +1297,12 @@ private struct MonitorPageView: View {
                 }
                 if let parentThreadID = state.currentParentThreadID, !parentThreadID.isEmpty {
                     ProvenanceRow(label: "Parent Thread", value: parentThreadID)
+                }
+                if state.currentSubagentCount > 0 {
+                    ProvenanceRow(label: "Subagents", value: "\(state.currentSubagentCount) in this visible thread")
+                }
+                if let latestTitle = state.currentLatestTitle, !latestTitle.isEmpty, latestTitle != state.title {
+                    ProvenanceRow(label: "Latest Activity", value: latestTitle)
                 }
                 if let rolloutPath = state.currentRolloutPath, !rolloutPath.isEmpty {
                     ProvenanceRow(label: "Rollout", value: rolloutPath)
@@ -1562,7 +1581,12 @@ private struct SessionRowView: View {
                             text: session.bridgeReplyAvailable ? "Direct" : (session.sourceKind ?? session.source).uppercased(),
                             style: .neutral
                         )
-                        if session.sourceKind == "subagent" {
+                        if let subagentCount = session.subagentCount, subagentCount > 0 {
+                            DetailBadge(
+                                text: "\(subagentCount) SubAgents",
+                                style: .warning
+                            )
+                        } else if session.sourceKind == "subagent" {
                             DetailBadge(
                                 text: session.agentRole?.isEmpty == false ? (session.agentRole ?? "SubAgent") : "SubAgent",
                                 style: .warning
@@ -1617,6 +1641,9 @@ private struct SessionRowView: View {
     }
 
     private var sessionRowFootnote: String {
+        if let model = session.model, !model.isEmpty {
+            return ComposerModelOption.displayName(for: model)
+        }
         if session.sourceKind == "subagent" {
             let nickname = session.agentNickname?.trimmingCharacters(in: .whitespacesAndNewlines)
             if let nickname, !nickname.isEmpty {

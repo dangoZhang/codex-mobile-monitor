@@ -30,35 +30,55 @@ enum ComposerAccessMode: String, CaseIterable, Identifiable {
     }
 }
 
-enum ComposerModelOption: String, CaseIterable, Identifiable {
-    case automatic = ""
-    case gpt54 = "gpt-5.4"
-    case gpt53Codex = "gpt-5.3-codex"
-    case gpt52 = "gpt-5.2"
-    case o3 = "o3"
+struct ComposerModelOption: Identifiable, Hashable {
+    let rawValue: String
 
     var id: String { rawValue.isEmpty ? "automatic" : rawValue }
 
     var title: String {
-        switch self {
-        case .automatic:
+        if rawValue.isEmpty {
             return "跟随桌面默认"
-        case .gpt54:
-            return "GPT-5.4"
-        case .gpt53Codex:
-            return "GPT-5.3-Codex"
-        case .gpt52:
-            return "GPT-5.2"
-        case .o3:
-            return "O3"
         }
+        return Self.displayName(for: rawValue)
     }
 
+    static let automatic = ComposerModelOption(rawValue: "")
+    static let fallbackOptions = [
+        ComposerModelOption.automatic,
+        ComposerModelOption(rawValue: "gpt-5.4"),
+        ComposerModelOption(rawValue: "gpt-5.3-codex")
+    ]
+
     static func from(raw: String?) -> ComposerModelOption {
-        guard let raw, let matched = Self.allCases.first(where: { $0.rawValue == raw }) else {
-            return .automatic
+        let cleaned = raw?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return ComposerModelOption(rawValue: cleaned)
+    }
+
+    static func options(from models: [String], selectedRawValue: String?) -> [ComposerModelOption] {
+        var seen: Set<String> = []
+        var options: [ComposerModelOption] = [.automatic]
+
+        for candidate in models + [selectedRawValue ?? ""] {
+            let cleaned = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !cleaned.isEmpty, seen.insert(cleaned).inserted else { continue }
+            options.append(ComposerModelOption(rawValue: cleaned))
         }
-        return matched
+
+        if options.count == 1 {
+            return fallbackOptions
+        }
+        return options
+    }
+
+    static func displayName(for raw: String) -> String {
+        switch raw.lowercased() {
+        case "gpt-5.4":
+            return "GPT-5.4"
+        case "gpt-5.3-codex":
+            return "GPT-5.3-Codex"
+        default:
+            return raw
+        }
     }
 }
 
@@ -73,6 +93,14 @@ struct DraftAttachment: Identifiable, Hashable {
 
 struct SessionListResponse: Decodable {
     let sessions: [SessionSummary]
+    let availableModels: [String]
+    let defaultModel: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case sessions
+        case availableModels = "available_models"
+        case defaultModel = "default_model"
+    }
 }
 
 struct SessionSummary: Decodable, Identifiable, Hashable {
@@ -92,6 +120,7 @@ struct SessionSummary: Decodable, Identifiable, Hashable {
     let desktopThread: Bool
     let dataSource: String
     let rolloutPath: String?
+    let model: String?
     let modelProvider: String?
     let cliVersion: String?
     let parentThreadID: String?
@@ -102,6 +131,10 @@ struct SessionSummary: Decodable, Identifiable, Hashable {
     let running: Bool
     let messageCount: Int
     let lastMessagePreview: String
+    let sessionCount: Int?
+    let subagentCount: Int?
+    let latestTitle: String?
+    let latestSessionID: String?
 
     private enum CodingKeys: String, CodingKey {
         case id
@@ -120,6 +153,7 @@ struct SessionSummary: Decodable, Identifiable, Hashable {
         case desktopThread = "desktop_thread"
         case dataSource = "data_source"
         case rolloutPath = "rollout_path"
+        case model
         case modelProvider = "model_provider"
         case cliVersion = "cli_version"
         case parentThreadID = "parent_thread_id"
@@ -130,6 +164,10 @@ struct SessionSummary: Decodable, Identifiable, Hashable {
         case running
         case messageCount = "message_count"
         case lastMessagePreview = "last_message_preview"
+        case sessionCount = "session_count"
+        case subagentCount = "subagent_count"
+        case latestTitle = "latest_title"
+        case latestSessionID = "latest_session_id"
     }
 }
 
@@ -150,6 +188,7 @@ struct SessionDetail: Decodable {
     let desktopThread: Bool
     let dataSource: String
     let rolloutPath: String?
+    let model: String?
     let modelProvider: String?
     let cliVersion: String?
     let parentThreadID: String?
@@ -160,6 +199,10 @@ struct SessionDetail: Decodable {
     let running: Bool
     let messageCount: Int
     let lastMessagePreview: String
+    let sessionCount: Int?
+    let subagentCount: Int?
+    let latestTitle: String?
+    let latestSessionID: String?
     let messages: [ChatMessage]
     let lastEventSequence: Int
 
@@ -180,6 +223,7 @@ struct SessionDetail: Decodable {
         case desktopThread = "desktop_thread"
         case dataSource = "data_source"
         case rolloutPath = "rollout_path"
+        case model
         case modelProvider = "model_provider"
         case cliVersion = "cli_version"
         case parentThreadID = "parent_thread_id"
@@ -190,6 +234,10 @@ struct SessionDetail: Decodable {
         case running
         case messageCount = "message_count"
         case lastMessagePreview = "last_message_preview"
+        case sessionCount = "session_count"
+        case subagentCount = "subagent_count"
+        case latestTitle = "latest_title"
+        case latestSessionID = "latest_session_id"
         case messages
         case lastEventSequence = "last_event_sequence"
     }
